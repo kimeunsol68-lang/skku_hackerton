@@ -256,7 +256,7 @@ class RotaryMission(MissionBase):
             return 0
         arc = wrap_arr(np.arctan2(pts[:, 1] - g['cy'], pts[:, 0] - g['cx']) - g['theta_entry']) * g['R']
         lo, hi = arc + ROLL_V_NPC[0] * t_arr, arc + ROLL_V_NPC[1] * t_arr
-        return int(((hi >= -ROLL_UP_SAFE_M) & (lo <= ROLL_DOWN_CLEAR_M)).sum())
+        return int(((hi >= -ROLL_UP_SAFE_M) & (lo <= getattr(self, 'roll_down_m', ROLL_DOWN_CLEAR_M))).sum())
 
     @staticmethod
     def _fmt(a):
@@ -289,7 +289,11 @@ class RotaryMission(MissionBase):
             # 공격 모드(2차 시도): 합류 여유를 줄이고 출구·접근·원 안 속도를 올림
             self.exit_cap_m = 20.0 if fast_mode(opts) else EXIT_CAP_M
             self.a_decel = 3.0 if fast_mode(opts) else A_DECEL
-            self.rolling = False                # 무정지 합류: NPC 충돌 3회(seed 0) -> 끔
+            # 무정지 합류(공격 모드만): 이전 충돌 3회는 5 m/s로 합류해 앞 NPC(2.7~3.5 m/s)를 추돌한 것으로 보임 ->
+            # 앞 NPC가 도착 시점에 12 m 이상 앞일 때만 합류, 원 안에서는 10 m 앞까지 보고 NPC보다 0.5 m/s 느리게 따라감
+            self.rolling = False                # 무정지 합류: 조건 강화 후에도 NPC 충돌(seed 7 x2) -> 끔
+            self.roll_down_m = 12.0
+            self.follow_ahead_m, self.follow_margin = (10.0, 0.5) if fast_mode(opts) else (FOLLOW_AHEAD_M, 0.2)
             self.t_clear, self.exit_speed, self.approach_vmax, self.go_speed = \
                 (3.4, 8.0, 8.0, 6.3) if fast_mode(opts) else (T_CLEAR, EXIT_SPEED, APPROACH_VMAX, GO_SPEED)
             if self.log and not self.enabled:
@@ -389,11 +393,11 @@ class RotaryMission(MissionBase):
         if len(xy):
             ego_i = inp.cp.index if inp.cp is not None else 0
             gi, s_p, d_p = self._frenet(xy, max(0, ego_i - SEARCH_BEHIND), min(len(self.pts), ego_i + SEARCH_AHEAD))
-            ahead = (s_p > s_front) & (s_p <= s_front + FOLLOW_AHEAD_M) & (np.abs(d_p) <= FOLLOW_HALF_W)
+            ahead = (s_p > s_front) & (s_p <= s_front + getattr(self, 'follow_ahead_m', FOLLOW_AHEAD_M)) & (np.abs(d_p) <= FOLLOW_HALF_W)
             if int(ahead.sum()) >= MIN_DANGER_POINTS:
                 self.follow_until = inp.t + FOLLOW_HOLD_S
         if inp.t < self.follow_until:
-            v = min(max(FOLLOW_SPEED, self.npc_v - 0.2), 4.0)              # NPC와 같은 속도: 뒤 NPC가 추돌하지 않게
+            v = min(max(FOLLOW_SPEED, self.npc_v - getattr(self, 'follow_margin', 0.2)), 4.0)              # NPC와 같은 속도: 뒤 NPC가 추돌하지 않게
         return MissionOutput(override_path=self._with_limits(inp.local_path, lambda s_p: v))
 
     # ---- 경로에 속도 한계 붙이기 ------------------------------------------------------------------------
