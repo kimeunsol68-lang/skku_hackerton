@@ -443,7 +443,7 @@ class Parking:
             if turn < 0.05:
                 v_t = p['park_v_reverse_fast']
             left = (self.main_n - 1 - idx) * 0.05
-            v_t = min(v_t, math.sqrt(0.35**2 + 2.0 * 0.8 * max(0.0, left-0.15)))
+            v_t = min(v_t, math.sqrt(0.35**2 + 2.0 * p.get('park_rev_decel', 0.8) * max(0.0, left-0.15)))
             acc, brk = self._speed(v_t, v, dt)
             return acc, brk, steer, GEAR_REVERSE
         if st == 'STOP_REV':
