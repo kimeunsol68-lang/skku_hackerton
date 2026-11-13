@@ -64,6 +64,9 @@ TARGET_SPEED_DEFAULT = 5.0
 FIRST_BEND = (55.0, 76.0, -12.0, 2.0)   # 저마찰 구역 첫 S커브 (x0, x1, y0, y1)
 FIRST_BEND_A_LAT = 1.35
 
+CP7_STRAIGHT = (0.0, 62.0, 150.0, 157.0)   # cp6 -> cp7 직선 (x0, x1, y0, y1)
+CP7_VMAX = 15.0
+
 FAST_PARAMS = {
     'a_lat_max': 3.5,       # 마른 노면 커브 (안전 3.0). 3.8 + v_max 15에서 cp2 뒤·cp5 뒤 커브 충돌
     'a_decel': 3.0,         # 커브 앞 감속 계획
@@ -201,6 +204,7 @@ class Control(Node):
             if not hasattr(self, '_safe_params'):
                 self._safe_params = {k: getattr(self, k) for k in FAST_PARAMS}
             fast = fast_mode(options)
+            self.fast = fast
             for k, v in (FAST_PARAMS if fast else self._safe_params).items():
                 setattr(self, k, v)
             if fast:
@@ -472,6 +476,10 @@ class Control(Node):
             else:
                 a_lat = self.a_lat_slope if slope[i] else self.a_lat_max
                 lo, hi = self.v_min, min(self.v_max, self.v_max_slope) if slope[i] else self.v_max
+                if getattr(self, 'fast', False) and not slope[i]:
+                    px, py = self.path[i][0], self.path[i][1]
+                    if CP7_STRAIGHT[0] <= px <= CP7_STRAIGHT[1] and CP7_STRAIGHT[2] <= py <= CP7_STRAIGHT[3]:
+                        hi = CP7_VMAX                       # 공격 모드: cp6 -> cp7 직선만 15 m/s (커브 앞 감속은 그대로 계획)
                 reason = 'slope' if slope[i] else 'straight'
             if self._obst[i]:                        # 장애물 구간: 어디서 장애물이 나와도 대응할 수 있게 미리 속도를 낮춤
                 hi = min(hi, self.v_max_obstacle)

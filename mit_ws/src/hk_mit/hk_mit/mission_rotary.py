@@ -291,6 +291,8 @@ class RotaryMission(MissionBase):
             self.a_decel = 3.0 if fast_mode(opts) else A_DECEL
             # 무정지 합류(공격 모드만): 이전 충돌 3회는 5 m/s로 합류해 앞 NPC(2.7~3.5 m/s)를 추돌한 것으로 보임 ->
             # 앞 NPC가 도착 시점에 12 m 이상 앞일 때만 합류, 원 안에서는 10 m 앞까지 보고 NPC보다 0.5 m/s 느리게 따라감
+            # 공격 모드: 거의 섰을 때(0.8 m/s)부터 판단하고 빈 프레임 1개로 출발 (출발 자체는 이미 풀 가속)
+            self.stopped_speed, self.clear_need = (0.8, 1) if fast_mode(opts) else (STOPPED_SPEED, CLEAR_FRAMES)
             self.rolling = False                # 무정지 합류: 조건 강화 후에도 NPC 충돌(seed 7 x2) -> 끔
             self.roll_down_m = 12.0
             self.follow_ahead_m, self.follow_margin = FOLLOW_AHEAD_M, 0.2   # 무정지 합류를 껐으므로 기존 추종 (6.5 m, NPC-0.2)
@@ -337,7 +339,7 @@ class RotaryMission(MissionBase):
         if stop_rear - s_ego > APPROACH_VIEW_M:
             return MissionOutput()
         at_line = s_front >= stop_front
-        stopped = abs(inp.speed) < STOPPED_SPEED
+        stopped = abs(inp.speed) < getattr(self, 'stopped_speed', STOPPED_SPEED)
         if at_line and stopped:                                          # 정지선에서 기다리는 중: 위험 구간이 비는지 본다
             if self.wait_since is None:
                 self.wait_since = inp.t
@@ -351,7 +353,7 @@ class RotaryMission(MissionBase):
                 self.timeout_warned = True
                 if self.log:
                     self.log.warn('로터리 대기 장기화: 위험 구간이 비었다는 새 관측이 있어야 출발합니다')
-            if self.clear_frames >= CLEAR_FRAMES and new_frame:
+            if self.clear_frames >= getattr(self, 'clear_need', CLEAR_FRAMES) and new_frame:
                 self.entered = True
                 if self.log:
                     self.log.info('로터리 빈 공간 확인: 진입')
