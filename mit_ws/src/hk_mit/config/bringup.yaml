@@ -13,14 +13,19 @@ hk_mit_planner:
     odom_timeout_s: 0.30
     scan_timeout_s: 0.35
     diagnostic_period_s: 1.0
-    park_v_reverse: 2.0      # 잔걸음 대신 또렷한 S커브 후진 (1.2 -> 2.0)
-    park_v_reverse_fast: 2.2  # straight portions only
-    park_v_adjust: 1.4       # 보정·탈출 속력 (0.5 -> 1.4)
-    park_v_exit: 3.0         # 탈출 전진 속력 (2.0 -> 3.0)
-    park_decel: 1.8          # 접근 감속 계획 (1.0 -> 1.8): 접근 구간 단축
-    rpark_v_enter_fast: 5.0  # 후면주차 진입 직선 최고 속력 (4.0 -> 5.0). 호 구간은 rpark_v_enter 3.0 그대로
-    rpark_a_dec: 2.0         # 후면주차 호 앞 감속 계획 (1.5 -> 2.0)
-    rpark_v_exit_fast: 6.0   # 후면주차 탈출 직선 최고 속력 (5.0 -> 6.0)
+    park_v_approach: 7.0     # 평행주차 접근 속력 6.0 -> 7.0 (정지 목표까지 park_decel로 감속)
+    park_v_reverse: 2.3      # 후진 호 속력 (m/s). 2.0까지 무사고 확인, 2.3은 한 단계 상향 (호 R=4.5 m에서 횡가속 1.2 m/s²)
+    park_v_reverse_fast: 2.6  # straight portions only
+    park_v_adjust: 1.4       # 보정·탈출 속력
+    park_v_exit: 3.5         # 탈출 전진 속력 3.0 -> 3.5
+    park_decel: 2.2          # 접근 감속 계획 (m/s^2) 1.8 -> 2.2
+    rpark_v_approach: 6.5    # 평행주차 -> 후면주차 통로 이동 속력 (옛 하드코딩 2.5 -> 6.5)
+    rpark_v_enter: 3.5       # 후면주차 진입 호(R 4.6 m) 속력 3.0 -> 3.5 (횡가속 2.7 m/s², 마른 노면)
+    rpark_v_enter_fast: 8.0  # 후면주차 진입 직선 최고 속력 4.0 -> 8.0 (호 앞에서 rpark_a_dec로 미리 감속)
+    rpark_a_dec: 3.0         # 후면주차 호 앞 감속 계획 1.5 -> 3.0
+    rpark_v_reverse: 3.5     # 후면주차 후진 속력 상한 3.0 -> 3.5 (끝에 가까우면 0.5+1.1*남은거리로 자동 감속)
+    rpark_v_exit: 3.5        # 후면주차 탈출 호 속력 3.0 -> 3.5 (실측 EXIT_FWD 7.6 s가 가장 긴 단계)
+    rpark_v_exit_fast: 7.0   # 후면주차 탈출 직선 최고 속력 5.0 -> 7.0
     park_phase_timeout_s: 9.0   # 후진/전진 등 한 phase 최대 시간 (s). 정상 후진(~7 s)은 끊지 않음
     park_total_timeout_s: 22.0  # 전체 주차 시도 최대 시간 (s). 넘으면 멈춘 자리에서 완료 처리
     park_hold_s: 3.1         # required 3 s stop
@@ -31,10 +36,12 @@ hk_mit_control:
   ros__parameters:
     # --- 속도 프로파일 (곡률 기반). 주의: launch의 target_speed 인자는 프로파일을 쓰는 동안 무시됩니다 ---
     profile_enabled: 1.0          # 1: 곡률 기반 속도 프로파일, 0: target_speed 하나로 (예전 방식)
-    v_max: 13.0                   # 직선 최고 속도 (m/s) (12 -> 13: 긴 직선 구간만 영향)
+    v_max: 15.0                   # 직선 최고 속도 (m/s) (13 -> 15). 15 이상은 가속·곡률이 지배해서 거의 효과 없음 (모델: 15->18 = -0.3 s)
     v_min: 4.5                    # compatibility only; never overrides curvature limit
-    a_lat_max: 3.5                # 코너에서 허용할 횡가속도 (m/s²). 3.2 -> 3.5 (마른 노면, 기록된 최대 횡오차 0.45 m 기준 여유 있음). 미끄러지면 낮추기
-    a_decel: 3.0                  # 코너 진입 전 미리 감속하는 세기 (m/s²). 작을수록 일찍 감속 (2.6 -> 3.0, μ=1.0 노면)
+    a_lat_max: 3.4                # 코너에서 허용할 횡가속도 (m/s²). 3.2 -> 3.4. 저마찰·경사 구역은 별도 값(a_lat_lowmu/a_lat_slope)이라
+                                  # 영향 없고, 마른 노면 코너만 빨라짐. 2차 튠에서 3.5로 올렸을 때 복귀 이력이 있어 한 단계만. 미끄러지면 되돌리기
+    a_decel: 3.5                  # 코너 진입 전 미리 감속하는 세기 (m/s²). 3.0 -> 3.5 (brake=1의 추정 감속 4.0의 88%)
+                                  # 코너 사이 짧은 직선에서 더 늦게까지 달림. 코너 속도 자체는 a_lat_max가 결정
     curv_window_m: 3.0            # 곡률을 잴 때 앞뒤로 보는 길이 (m)
     brake_ff_decel: 4.0           # 앞먹임 제동: brake=1일 때 감속 추정 (m/s²). 0이면 끔
     brake_ff_lookahead_s: 0.8     # 앞먹임 제동이 내다보는 시간 (s)
@@ -45,15 +52,17 @@ hk_mit_control:
     diagnostic_period_s: 1.0
     target_speed: 5.0             # 프로파일을 끌 때(profile_enabled: 0)만 쓰는 목표 속력 (m/s)
     # --- 저마찰 구간 (course.json의 low_friction zone 안에서만 적용) ---
-    v_max_obstacle: 5.5           # approach; actual avoidance has separate 4.5 m/s cap (mission_obstacle SPEED_LIMIT)
+    v_max_obstacle: 8.0           # 장애물 1개 구간 "장애물을 찾기 전" 속도 5.5 -> 8.0. 회피를 시작하면 미션이 경로에 4.5를 붙여 직접 제한한다.
+                                  # 근거: 감지 범위 24 m, 8.0 -> 4.5 감속에 6.3 m(a_decel 3.5), 목표 차선 도착까지 8.5 m -> 합 14.8 m < 24 m
+                                  # 효과: 장애물을 지나친 뒤 구역 끝까지 5.5로 끌려다니던 구간이 풀림 (cp1->cp2 8.4 -> 6.5 s)
+    v_max_obstacle3: 15.0         # 장애물 3개 구간은 포기(회피 안 함) -> 구역 속도 제한 없음 (= v_max). 곡률 제한만 받음
     obstacle_lead_m: 12.0         # 장애물 구역 입구 이만큼(m) 앞에서부터 v_max_obstacle로 달림
     lowmu_enabled: 1.0            # 1: 저마찰 구역 대응 켬, 0: 끔. 시뮬레이터 저마찰 옵션을 끄고 달릴 때는 0.0
-    a_lat_lowmu: 1.6              # ~82% of mu=0.2 limit (1.96); 1.5 (seeds 0-3 no slip) -> 1.6. 슬립 기록으로 확인하며 올림
+    a_lat_lowmu: 1.5              # ~77% of mu=0.2 limit (1.96); 1.05 -> 1.35 (seeds 1-3 no slip) -> 1.5
     v_min_lowmu: 2.3              # 이 구간의 최저 속도 (m/s)
     v_max_lowmu: 6.0              # 이 구간의 최고 속도 (m/s) (5.0 -> 6.0: 직선만 영향, 커브는 a_lat_lowmu가 제한)
     a_decel_lowmu: 1.3            # 이 구간의 감속 계획 (m/s²). 작을수록 일찍 감속 (1.0 -> 1.3, μ=0.2 한계 1.96의 66%)
-    lowmu_brake_lead_m: 4.0       # 구역 앞 이만큼(m)부터만 저마찰 감속으로 계획. 그 앞 마른 노면에서는 a_decel(3.0)로 늦게 제동
-    accel_max_lowmu: 0.4          # 이 구간의 구동 상한 (0~1). 0.3에서는 커브 목표 속도(3.5)에도 못 미쳤음(3.2) -> 0.4 (뒷바퀴 슬립 기록 보며 조정)
+    accel_max_lowmu: 0.3          # 이 구간의 구동 상한 (0~1)
     brake_max_lowmu: 0.35         # 이 구간의 제동 상한 (0~1). 바퀴 잠김 방지
     steer_rate_lowmu: 6.0         # 이 구간의 조향 변화율 한계 (1/s). 사실상 제한 없음. 방향이 바뀔 때는 항상 즉시 추종
     lowmu_lead_m: 12.0            # 저마찰 구역 앞 이만큼(m)부터 저마찰 속도 한계 적용 (구역 경계 오차 대비)
@@ -61,9 +70,11 @@ hk_mit_control:
     k_soft_lowmu: 0.3             # 저마찰 구간 Stanley 저속 완화값 (m/s). 작을수록 저속에서 적극적
     k_heading_lowmu: 1.0          # 저마찰 구간 방향 오차(전방 주시) 가중치
     # --- 경사 구간 (course.json의 slope zone 안에서만 적용) ---
-    v_max_slope: 8.0              # 이 구간의 최고 속도 (m/s). 내리막 과속 방지
-    a_lat_slope: 3.0          # extra corner margin in slope S bends (2.8 -> 3.0: R=7 m 헤어핀 4.4 -> 4.6 m/s. 벽 접촉 이력이 있어 소폭만)
-    corner_hold_m: 8.0        # 급커브 앞 이 거리(m) 안에서는 그 커브 속도 + margin까지만 허용 (S커브 사이 직선 가속 방지)
+    v_max_slope: 10.0             # 이 구간의 최고 속도 (m/s). 8.0 -> 10.0. 헤어핀은 a_lat_slope(2.8)가 4.7 m/s로 제한하므로
+                                  # 경사 구간 안의 직선(R=45 m)에서만 빨라짐 (코너 속도는 그대로)
+    a_lat_slope: 2.8          # extra corner margin in slope S bends
+    corner_hold_m: 3.0        # 급커브 앞 이 거리(m) 안에서는 그 커브 속도 + margin까지만 허용 (S커브 사이 직선 가속 방지)
+                              # 8.0 -> 3.0: 코너 사이 짧은 직선에서 더 일찍 가속 (코너 통과 속도 자체는 a_lat_max가 결정, 변화 없음)
     corner_hold_margin: 0.6
     corner_hold_vmax: 6.0
     slope_ki_mult: 2.0            # 이 구간의 적분 이득 배수 (오르막 처짐·내리막 과속을 빨리 보정)

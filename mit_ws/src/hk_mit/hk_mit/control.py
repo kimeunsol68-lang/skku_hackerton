@@ -68,10 +68,10 @@ PARAMS = {
     'ki': 0.08,            # 속력 I 이득
     'brake_gain': 0.6,     # 너무 빠를 때 제동 세기
     'profile_enabled': 1.0,   # 1: 곡률 기반 속도 프로파일, 0: target_speed 하나로 (예전 방식)
-    'v_max': 12.0,         # 직선 최고 속도 (m/s)
+    'v_max': 15.0,         # 직선 최고 속도 (m/s)
     'v_min': 4.5,          # 급커브에서도 이 속도 밑으로는 낮추지 않음 (m/s)
     'a_lat_max': 3.2,      # 코너에서 허용할 횡가속도 (m/s²)
-    'a_decel': 2.6,        # 코너 진입 전에 미리 감속하는 세기 (m/s², 클수록 늦게 감속)
+    'a_decel': 3.5,        # 코너 진입 전에 미리 감속하는 세기 (m/s², 클수록 늦게 감속)
     'curv_window_m': 3.0,  # 곡률을 잴 때 앞뒤로 보는 길이 (m). 노이즈를 줄임
     'brake_ff_decel': 4.0,   # 제동 앞먹임: brake=1일 때의 감속(m/s²) 추정. 크게 잡으면 앞먹임 제동이 약해짐 (0이면 끔)
     'brake_ff_lookahead_s': 0.8,  # 앞먹임 제동이 내다보는 시간 (s)
@@ -87,23 +87,23 @@ PARAMS = {
     'brake_max_lowmu': 0.35,  # 이 구간의 제동 상한 (0~1). 바퀴 잠김 방지
     'steer_rate_lowmu': 6.0,  # 이 구간의 조향 변화율 한계 (1/s, 1 = 풀 조향). 사실상 제한 없음. 방향이 바뀔 때는 항상 즉시 추종
     # --- 경사 구간 (course.json의 slope zone 안) ---
-    'v_max_slope': 8.0,    # 이 구간의 최고 속도 (m/s). 내리막 과속 방지
+    'v_max_slope': 10.0,   # 이 구간의 최고 속도 (m/s). 헤어핀은 a_lat_slope가 제한하므로 구간 내 직선만 영향
     'slope_ki_mult': 2.0,  # 이 구간에서 적분 이득 배수 (오르막 처짐·내리막 과속을 빨리 보정)
     # --- 공통 ---
     'steer_rate_max': 8.0,    # 조향 변화율 한계 (1/s). 사실상 제한 없음. 방향이 바뀔 때는 항상 즉시 추종
     'brake_on': 0.10,      # 구동 -> 제동으로 바꾸는 문턱 (u가 -brake_on보다 작을 때)
     'brake_off': 0.03,     # 제동 -> 구동으로 되돌리는 문턱 (u가 -brake_off보다 클 때). 떨림 방지
-    'v_max_obstacle': 3.5,   # 장애물 구간(obstacle1/obstacle3 zone) 안 최고 속도 (m/s). 미션이 장애물을 찾기 전에도 미리 낮춰 둠
+    'v_max_obstacle': 8.0,   # 장애물 1개 구간에서 장애물을 찾기 전 속도 (m/s). 회피 시작 후에는 미션이 직접 제한
     'obstacle_lead_m': 12.0,  # 장애물 구역 입구 이만큼(m) 앞에서부터 이미 v_max_obstacle로 달리게 함
+    'v_max_obstacle3': 15.0,  # 장애물 3개 구간(obstacle3 zone) 안 최고 속도 (m/s). 구간을 포기하므로 제한 없음(= v_max)
     'lowmu_enabled': 1.0,  # 1: 저마찰 구역 대응 켬, 0: 끔 (시뮬레이터 저마찰 옵션을 끄고 달릴 때 0으로 두면 원래 속도로 달림)
     'lowmu_lead_m': 12.0,  # 저마찰 구역 경계가 어긋나도 안전하도록, 구역 앞 이만큼(m)부터 저마찰 속도 한계를 적용
-    'lowmu_brake_lead_m': 4.0,  # 구역 앞 이만큼(m)부터는 저마찰 감속(a_decel_lowmu)으로 계획. 그보다 앞(마른 노면)에서는 a_decel로 제동
     'k_stanley_lowmu': 2.0,   # 저마찰 구간 Stanley 옆오차 이득 (저속에서 조향을 끝까지 쓰도록)
     'k_soft_lowmu': 0.3,   # 저마찰 구간 Stanley 저속 완화값 (m/s). 작을수록 저속에서 더 적극적
     'k_heading_lowmu': 1.0,   # 저마찰 구간 방향 오차(전방 주시) 가중치
     'track_point_m': 2.6,  # Stanley가 경로에 맞추는 점: 뒤차축에서 앞으로 이만큼 (3.0 = 앞바퀴 축). 줄이면 뒤쪽이 코너 안쪽으로 덜 파고듦
     'a_lat_slope': 2.8,
-    'corner_hold_m': 8.0,           # 급커브 앞 이 거리(m) 안에서는 그 커브 속도 + margin까지만 허용 (0이면 끔)
+    'corner_hold_m': 3.0,           # 급커브 앞 이 거리(m) 안에서는 그 커브 속도 + margin까지만 허용 (0이면 끔)
     'corner_hold_margin': 0.6,      # 위 허용 여유 (m/s)
     'corner_hold_vmax': 6.0,        # 이 속도보다 느린 커브만 급커브로 봄 (m/s)
     'odom_timeout_s': 0.30,
@@ -134,7 +134,7 @@ class Control(Node):
         self.override_active = False
         self.path_vlim = []
         self._curv_src = self._curv = self._s = self._prof = None
-        self._low = self._slope = self._low_plan = self._obst = []
+        self._low = self._slope = self._low_plan = self._obst = self._obst3 = []
         self._steer_last = 0.0                       # 마지막으로 보낸 조향 (조향 변화율 제한용)
         self._braking = False                        # 구동/제동 전환 히스테리시스 상태
         self._u_sat = 0.0
@@ -398,19 +398,22 @@ class Control(Node):
         self._curv_src, self._curv, self._s = path, k, s
         self._low = [self.in_zone('low_friction', p[0], p[1]) for p in path]
         self._slope = [self.in_zone('slope', p[0], p[1]) for p in path]
-        obst = [self.in_zone('obstacle1', p[0], p[1]) or self.in_zone('obstacle3', p[0], p[1]) for p in path]
-        self._obst, nxt = [False] * n, None         # 장애물 구역 입구 obstacle_lead_m 앞부터 구역 끝까지
+        obst = [self.in_zone('obstacle1', p[0], p[1]) for p in path]
+        obst3 = [self.in_zone('obstacle3', p[0], p[1]) for p in path]
+        self._obst, self._obst3, nxt, nxt3 = [False] * n, [False] * n, None, None   # 구역 입구 obstacle_lead_m 앞부터 구역 끝까지
         for i in range(n - 1, -1, -1):
             if obst[i]:
                 nxt = s[i]
+            if obst3[i]:
+                nxt3 = s[i]
             self._obst[i] = nxt is not None and nxt - s[i] <= self.obstacle_lead_m
-        plan, brake, nxt = [False] * n, [False] * n, None   # 계획용: 저마찰 구역 앞 lowmu_lead_m 구간도 저마찰로 봄
+            self._obst3[i] = nxt3 is not None and nxt3 - s[i] <= self.obstacle_lead_m
+        plan, nxt = [False] * n, None               # 계획용: 저마찰 구역 앞 lowmu_lead_m 구간도 저마찰로 봄
         for i in range(n - 1, -1, -1):
             if self._low[i]:
                 nxt = s[i]
             plan[i] = nxt is not None and nxt - s[i] <= self.lowmu_lead_m
-            brake[i] = nxt is not None and nxt - s[i] <= self.lowmu_brake_lead_m   # 감속 계획만 저마찰 값으로 (속도 상한은 plan)
-        self._low_plan, self._low_brake = plan, brake
+        self._low_plan = plan
         return k
 
     def brake_feedforward(self):
@@ -445,8 +448,8 @@ class Control(Node):
                 a_lat = self.a_lat_slope if slope[i] else self.a_lat_max
                 lo, hi = self.v_min, min(self.v_max, self.v_max_slope) if slope[i] else self.v_max
                 reason = 'slope' if slope[i] else 'straight'
-            if self._obst[i]:                        # 장애물 구간: 어디서 장애물이 나와도 대응할 수 있게 미리 속도를 낮춤
-                hi = min(hi, self.v_max_obstacle)
+            if self._obst[i] or self._obst3[i]:      # 장애물 구간: 어디서 장애물이 나와도 대응할 수 있게 미리 속도를 낮춤
+                hi = min(hi, self.v_max_obstacle if self._obst[i] else self.v_max_obstacle3)
                 lo = min(lo, hi)                     # v_min(4.5)이 구간 최고 속도보다 크면 구간 속도가 무시되므로 같이 낮춤
                 reason = 'obstacle_zone'
             curve_limit = math.sqrt(a_lat / max(abs(c), 1e-6))
@@ -471,7 +474,7 @@ class Control(Node):
                     reasons[i] = 'corner_hold'
             v = hold
         for i in range(n - 2, -1, -1):               # 앞쪽 점의 속도에서 감속으로 줄일 수 있는 속도까지만 허용
-            a_dec = self.a_decel_lowmu if self._low_brake[i] else self.a_decel   # 구역 앞 마른 노면에서는 평소 감속으로 늦게 제동
+            a_dec = self.a_decel_lowmu if low[i] else self.a_decel
             limit = math.sqrt(v[i + 1] ** 2 + 2.0 * a_dec * (s[i + 1] - s[i]))
             if limit < v[i]:
                 v[i], reasons[i] = limit, 'braking_ahead'

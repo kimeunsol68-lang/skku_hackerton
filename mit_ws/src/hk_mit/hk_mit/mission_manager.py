@@ -14,10 +14,12 @@ from .mission_rotary import RotaryMission
 from .course import load_options, option_on
 
 MISSIONS = (ParkingMission, ObstacleMission, RotaryMission)
-SECTION_OPTIONS = {('cp1', 'cp2'): 'obstacle1', ('cp6', 'cp7'): 'obstacle3',
+SECTION_OPTIONS = {('start', 'cp1'): 'obstacle1', ('cp1', 'cp2'): 'obstacle1', ('cp6', 'cp7'): 'obstacle3',
                    ('cp8', 'cp9'): 'parallel_parking', ('cp9', 'cp10'): 'rear_parking',
                    ('cp5', 'cp6'): 'roundabout'}
 ERROR_LOG_PERIOD_S = 1.0
+ERROR_GIVEUP_S = 2.0        # 같은 미션이 이 시간 넘게 계속 오류(예외·형식 오류)를 내면 그 구간에서 미션을 포기하고 기본 주행으로 넘긴다.
+                            # 미션 오류는 override_cmd 완전 정지를 내므로, 그대로 두면 제한시간으로 시도 전체를 잃는다 (실측 40 s 이상 정지)
 
 
 class MissionManager:
@@ -38,6 +40,7 @@ class MissionManager:
         self.section = None
         self.done = set()
         self.last_error = {}
+        self.error_since = {}            # (미션 이름, 구간) -> 연속 오류가 시작된 시각
         self.last_gear = 'D'
         for m in self.missions:
             self._safe(m, 'reset', 0.0, m.reset)
@@ -71,10 +74,11 @@ class MissionManager:
                 inp = MissionInput(x, y, yaw, speed, mission_path, scan, obstacles, t, state, info, scan_pose, pose_sigma)
             out = self._safe(m, 'update', t, m.update, inp)
             if not isinstance(out, MissionOutput):
-                return MissionOutput(override_cmd=(0.0, 1.0, 0.0, self.last_gear)), m.NAME + '_error', state
+                return self._on_error(m, sec, t, state)
             path, cmd = self._check_path(m, out.override_path, t), self._check_cmd(m, out.override_cmd, t)
             if (out.override_path is not None and path is None) or (out.override_cmd is not None and cmd is None):
-                return MissionOutput(override_cmd=(0.0, 1.0, 0.0, self.last_gear)), m.NAME + '_error', state
+                return self._on_error(m, sec, t, state)
+            self.error_since.pop((m.NAME, sec), None)      # 정상 동작: 연속 오류 기록을 지움
             out = MissionOutput(path, cmd, bool(out.is_done))
             if cmd is not None:
                 self.last_gear = cmd[3]
@@ -87,6 +91,16 @@ class MissionManager:
         return MissionOutput(), None, state
 
     # ---- 안전장치 --------------------------------------------------------------------------------------
+    def _on_error(self, m, sec, t, state):
+        """미션 오류: 잠깐은 세워 두지만, ERROR_GIVEUP_S를 넘기면 그 구간 미션을 포기하고 기본 주행으로 넘긴다."""
+        first = self.error_since.setdefault((m.NAME, sec), t)
+        if t - first > ERROR_GIVEUP_S:
+            self.done.add((m.NAME, sec))
+            if self.log:
+                self.log.error(f'미션 {m.NAME} 오류가 {ERROR_GIVEUP_S:.1f}s 넘게 계속되어 이 구간에서는 포기합니다 ({sec[0]} -> {sec[1]})')
+            return MissionOutput(), m.NAME + '_giveup', state
+        return MissionOutput(override_cmd=(0.0, 1.0, 0.0, self.last_gear)), m.NAME + '_error', state
+
     def _safe(self, m, what, t, fn, *args):
         try:
             return fn(*args)

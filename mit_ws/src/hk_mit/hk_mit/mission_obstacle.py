@@ -68,6 +68,13 @@ RETURN_M = 10.0         # return gently enough to keep the front corners inside 
 RAMP_MIN = 4.2          # 코사인 전환 최소 길이 (m)
 KAPPA_LIM = 0.10        # about 10 m lane-change ramps, checked against the whole body
 SPEED_LIMIT = 4.5       # maneuver only; ~2 m/s^2 lateral on the 0.10 1/m ramps. Was 3.2 (too slow to finish in 150 s)
+SLOW_START_SPEED = 2.5  # 램프 구간 안에서 회피를 시작해야 할 때(체크포인트 복귀 직후 등) 옆 이동이 끝나기 전까지의 속도 한계 (m/s)
+SPEED_LIMIT3 = 5.0      # 장애물 3개 구간(cp6 -> cp7) 회피 중 속도 한계 (m/s): 0.10 1/m 램프에서 횡가속 약 2.5 m/s²
+# 팀 전략: 장애물 3개 구간(cp6 -> cp7)은 포기한다. 회피를 시도하지 않고 전역 경로로 최고 속도로 통과한다.
+# (이 구간에서 회피 경로 여유가 부족하다고 판정되면 미션이 완전 정지로 얼어붙어 시도 전체를 잃었음 - 실측 14 s 이상)
+SKIP_OBSTACLE3 = True
+UNSAFE_MAX_S = 2.5      # 여유 부족 판정으로 세워 두는 최대 시간 (s). 넘으면 기본 경로로 넘겨 주행을 계속한다
+                        # (영원히 서 있으면 제한시간으로 0점, 접촉은 감점 1회 + 복귀라 회복 가능)
 PATH_BEHIND, PATH_AHEAD, PATH_STEP = 2.0, 18.0, 0.5   # override_path 범위 (뒤차축 기준 m)
 SEARCH_BEHIND, SEARCH_AHEAD = 12, 100   # 전역 경로에서 찾는 범위 (점 번호, 0.5 m 간격)
 
@@ -119,11 +126,15 @@ class Track:
 
 class ObstacleMission(MissionBase):
     NAME = 'obstacle'
-    SECTIONS = (('cp1', 'cp2'), ('cp6', 'cp7'))
+    # 출발 구간(start -> cp1)에서도 장애물 1 zone을 미리 추적: cp1을 5.5 m/s로 지나고 나서야 시작하면 zone 입구(cp1 뒤 5 m)
+    # 바로 뒤의 장애물은 피할 거리가 없음 (seed 78: cp1 복귀 -> 재충돌 반복).
+    SECTIONS = (('start', 'cp1'), ('cp1', 'cp2'), ('cp6', 'cp7'))
 
     def __init__(self, logger=None):
         self.pts = None            # 전역 경로 (N, 2), 처음 쓸 때 읽음
         self.lidar = (LIDAR_X, LIDAR_Y, LIDAR_YAW)
+        self.last_section = None
+        self.skipped3 = False
         super().__init__(logger)
 
     def reset(self):
@@ -132,9 +143,14 @@ class ObstacleMission(MissionBase):
         self.last_scan_stamp = None
         self.zone_half_width = 3.75
         self.last_warning = -math.inf
+        self.unsafe_since = None
 
     def on_enter(self, section):
+        if section == ('cp1', 'cp2') and self.last_section == ('start', 'cp1') and self.zone_box is not None:
+            self.last_section = section          # 같은 zone을 계속 추적: cp1을 지나도 추적을 지우지 않음
+            return
         self.reset()
+        self.last_section = section
 
     # ---- 준비 ---------------------------------------------------------------------------------------
     def _load(self):
@@ -327,7 +343,10 @@ class ObstacleMission(MissionBase):
         if options is None:
             options = load_options()
         option = 'obstacle3' if inp.cp and inp.cp.section == ('cp6', 'cp7') else 'obstacle1'
-        if not option_on(options, option):
+        if not option_on(options, option) or (option == 'obstacle3' and SKIP_OBSTACLE3):
+            if option == 'obstacle3' and SKIP_OBSTACLE3 and self.log and not self.skipped3:
+                self.skipped3 = True
+                self.log.info('장애물 3개 구간: 회피를 하지 않고 전역 경로로 통과합니다 (팀 전략)')
             self.reset()
             return MissionOutput(is_done=True)
         if self.pts is None:
@@ -408,11 +427,24 @@ class ObstacleMission(MissionBase):
                 safe = False
                 safety_reason = f'장애물 여유 s={tr.s:.1f}, d={tr.d:.2f}'
         if not safe:
+            if self.unsafe_since is None:
+                self.unsafe_since = inp.t
             if self.log and inp.t - self.last_warning > 1.0:
                 self.log.warn('회피 경로 차체 여유 부족: ' + safety_reason)
                 self.last_warning = inp.t
+            if inp.t - self.unsafe_since > UNSAFE_MAX_S:      # 계속 세워 두면 제한시간으로 시도 전체를 잃음
+                if self.log and inp.t - self.last_warning > 1.0:
+                    self.log.warn(f'여유 부족 {UNSAFE_MAX_S:.1f}s 초과: 기본 경로로 주행을 계속합니다')
+                return MissionOutput()
             return MissionOutput(override_cmd=(0.0, 1.0, 0.0, 'D'))
+        self.unsafe_since = None
         end_maneuver = max(tr.hi() + RETURN_M for tr in elems)
-        path = [(float(x), float(y), float(h), SPEED_LIMIT if s <= end_maneuver else 0.0)
+        v_lim = SPEED_LIMIT3 if option == 'obstacle3' else SPEED_LIMIT
+        if s_ego > anchors[0][0] - 1.0:                 # 램프가 이미 시작된 뒤에 합류(복귀 직후 등): 옆 이동이 끝날 때까지 느리게
+            # 주의: 위에서 rel을 각도 배열(yaw - route_heading)로 다시 쓰므로 여기서는 위치 벡터를 다시 구한다
+            d_ego = float((np.array([inp.x, inp.y]) - self.pts[ego_i]) @ self.nor[ego_i])
+            if abs(d_ego - float(self._cosine(anchors, np.array([s_ego]))[0])) > 0.6:
+                v_lim = SLOW_START_SPEED
+        path = [(float(x), float(y), float(h), v_lim if s <= end_maneuver else 0.0)
                 for (x, y), h, s in zip(new, yaw, s_grid)]
         return MissionOutput(override_path=path)
