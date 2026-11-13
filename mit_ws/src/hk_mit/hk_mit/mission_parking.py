@@ -49,8 +49,8 @@ PARAMS = {                               # config/bringup.yaml (hk_mit_control)�
     'park_slot_wid': 3.6,
     'park_start_y': 140.0,               # 이 y보다 내려오면 주차 모드 시작
     'park_end_y': 100.0,                 # (주차 전) 이 y보다 내려가면 주차 모드가 아님
-    'park_v_approach': 4.5,              # 접근 속력 (m/s)
-    'park_v_reverse': 1.0,               # 후진 속력 (m/s)
+    'park_v_approach': 6.0,              # 접근 속력 (m/s)
+    'park_v_reverse': 1.8,               # 후진 속력 (m/s)
     'park_v_exit': 2.0,                  # 평행 주차 탈출 전진 속력 (m/s)
     'park_v_adjust': 0.5,                # 보정·탈출 속력 (m/s)
     'park_decel': 1.0,                   # 접근 감속 계획 (m/s^2)
@@ -60,7 +60,7 @@ PARAMS = {                               # config/bringup.yaml (hk_mit_control)�
     'park_lookahead': 2.0,               # 후진 pure pursuit 전방 거리 (m)
     'park_kp': 0.6,
     'park_ki': 0.25,
-    'park_hold_s': 3.6,                  # 정지 유지 시간 (성공 조건은 3초)
+    'park_hold_s': 3.1,                  # 정지 유지 시간 (성공 조건은 3초)
     'park_tol_margin': 0.1,              # 차 네 모서리가 슬롯 안쪽으로 이만큼 더 들어와야 완료로 봄 (m)
     'park_exit_heading_deg': 40.0,       # 탈출 때 이만큼 왼쪽으로 돌면 경로 추종으로 넘김
     'park_exit_rear_clear': 0.4,         # 탈출 후진 때 뒤차와 남길 간격 (m)
@@ -378,7 +378,7 @@ class Parking:
             return 0.0, 1.0, 0.0, GEAR_DRIVE
         if st == 'SHIFT_R':
             steer, _ = self._pursuit(self.path, a, b, psi, True)
-            if now - self.t_state > 0.5:
+            if now - self.t_state > 0.4:
                 self._set('REVERSE', now)
             return 0.0, 1.0, steer, GEAR_REVERSE
         if st == 'REVERSE':
@@ -396,7 +396,7 @@ class Parking:
                 self._after_stop(a, b, psi, now)
             return 0.0, 1.0, 0.0, GEAR_REVERSE
         if st in ('ADJUST_SHIFT',):
-            if now - self.t_state > 0.5:
+            if now - self.t_state > 0.4:
                 self._set('ADJUST', now)
             return 0.0, 1.0, 0.0, GEAR_REVERSE if self.dir < 0 else GEAR_DRIVE
         if st == 'ADJUST':
@@ -427,7 +427,7 @@ class Parking:
                     self._set('EXIT_SHIFT_D', now)
             return 0.0, 1.0, 0.0, GEAR_REVERSE if self.dir < 0 else GEAR_DRIVE
         if st == 'EXIT_SHIFT_R':
-            if now - self.t_state > 0.5:
+            if now - self.t_state > 0.4:
                 self._set('EXIT_BACK', now)
             return 0.0, 1.0, 0.0, GEAR_REVERSE
         if st == 'EXIT_BACK':
@@ -442,7 +442,7 @@ class Parking:
                 self._set('EXIT_SHIFT_D', now)
             return 0.0, 1.0, 0.0, GEAR_REVERSE
         if st == 'EXIT_SHIFT_D':
-            if now - self.t_state > 0.5:
+            if now - self.t_state > 0.4:
                 self._set('EXIT_FWD', now)
             return 0.0, 1.0, 1.0, GEAR_DRIVE
         if st == 'EXIT_FWD':
@@ -498,9 +498,12 @@ RPARAMS = {                              # 후면 주차 (T자 통로) 값
     'rpark_r1': 4.6,                     # 진입 왼쪽 회전 반지름
     'rpark_r2': 4.6,                     # 안쪽에서 오른쪽(남쪽) 회전 반지름
     'rpark_gin': 0.5,                    # 통로 안에서 중심선보다 북쪽으로 붙는 양 (m)
-    'rpark_v_enter': 3.0,
-    'rpark_v_exit': 3.0,
-    'rpark_v_reverse': 2.0,              # 후면 주차 후진 속력 (끝이 가까우면 감속)
+    'rpark_v_enter': 3.0,                # 진입: 호(회전) 구간 속력
+    'rpark_v_enter_fast': 4.0,           # 진입: 직선 구간 최고 속력 (호 앞에서 미리 감속)
+    'rpark_v_exit': 3.0,                 # 탈출: 호 구간 속력
+    'rpark_v_exit_fast': 5.0,            # 탈출: 직선 구간 최고 속력
+    'rpark_a_dec': 1.5,                  # 호 앞 감속 계획 (m/s^2)
+    'rpark_v_reverse': 3.0,              # 후면 주차 후진 속력 (끝이 가까우면 감속)
     'rpark_exit_north': 0.3,             # 탈출 때 통로 안에서 중심선보다 북쪽으로 붙는 양 (m)
     'rpark_exit_r3': 4.6,
     'rpark_exit_r4': 4.6,
@@ -629,7 +632,25 @@ class RearParking(Parking):
         self.main_n = len(pts)
         for k in range(1, 31):
             pts.append((pts[-1][0], pts[-1][1] - 0.1, -math.pi / 2))
+        self.turn_d = self._turn_dist(pts)
         return pts
+
+    @staticmethod
+    def _turn_dist(path):
+        """각 점에서 다음 회전(호) 시작까지 경로를 따라 남은 거리 (m). 호 안이면 0."""
+        n = len(path)
+        d = [0.0] * n
+        for i in range(n - 2, -1, -1):
+            curved = abs(wrap(path[i + 1][2] - path[i][2])) > 1e-4
+            d[i] = 0.0 if curved else d[i + 1] + math.hypot(path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1])
+        d[n - 1] = d[n - 2] if n > 1 else 0.0
+        return d
+
+    def _path_speed(self, i, v_fast, v_arc):
+        d = self.turn_d[min(i, len(self.turn_d) - 1)]
+        if d <= 0.0:
+            return v_arc
+        return min(v_fast, math.sqrt(v_arc ** 2 + 2 * self.p['rpark_a_dec'] * d))
 
     def _reverse_path(self, x, y):
         pts = [(self.p['rpark_slot_x'] + (x - self.p['rpark_slot_x']) * max(0.0, 1 - 0.1 * k), y + 0.1 * k, math.pi / 2)
@@ -647,6 +668,7 @@ class RearParking(Parking):
         self.main_n = len(pts)
         for k in range(1, 31):
             pts.append((pts[-1][0], pts[-1][1] - 0.1, -math.pi / 2))
+        self.turn_d = self._turn_dist(pts)
         return pts
 
     def _in_slot(self, x, y, yaw):
@@ -710,7 +732,7 @@ class RearParking(Parking):
             if i >= self.main_n - 3:
                 self._set('STOP', now)
                 return 0.0, 1.0, 0.0, D
-            acc, brk = self._speed(p['rpark_v_enter'], v, dt)
+            acc, brk = self._speed(self._path_speed(i, p['rpark_v_enter_fast'], p['rpark_v_enter']), v, dt)
             return acc, brk, steer, D
         if st == 'STOP':
             if self._stopped(v, now) or now - self.t_state > 6.0:
@@ -721,7 +743,7 @@ class RearParking(Parking):
                 self._set('SHIFT_R', now)
             return 0.0, 1.0, 0.0, D
         if st == 'SHIFT_R':
-            if now - self.t_state > 0.5:
+            if now - self.t_state > 0.4:
                 self._set('REVERSE', now)
             return 0.0, 1.0, 0.0, R
         if st == 'REVERSE':
@@ -730,11 +752,12 @@ class RearParking(Parking):
             gap = self._rear_gap(self.scan_now)
             if gap is not None and gap < 6.0 and self.wall_stop:
                 self.wall_y = y + REAR_OVERHANG + gap            # 안쪽 벽의 y
-                left = min(left, gap - p['rpark_gap_stop'])
+                # 목표 = 벽 실측으로 잡은 슬롯 중심에 차 중심이 오는 위치 (통로 기준 추정값보다 정확)
+                left = (self.wall_y - p['rpark_wall_to_c'] + (CAR_LEN / 2 - REAR_OVERHANG)) - y
             if left <= self.rev_tol:
                 self._set('STOP_REV', now)
                 return 0.0, 1.0, 0.0, R
-            v_t = p['rpark_v_reverse'] if left > 2.5 else (0.8 if left > 1.0 else 0.5)
+            v_t = max(0.5, min(p['rpark_v_reverse'], 0.5 + 1.1 * left))      # 끝에 가까울수록 부드럽게 감속
             acc, brk = self._speed(v_t, v, dt)
             return acc, brk, steer, R
         if st == 'STOP_REV':
@@ -769,7 +792,7 @@ class RearParking(Parking):
                         self._set('REDO_SHIFT', now)
             return 0.0, 1.0, 0.0, R
         if st == 'REDO_SHIFT':
-            if now - self.t_state > 0.5:
+            if now - self.t_state > 0.4:
                 self._set('REDO', now)
             return 0.0, 1.0, 0.0, D
         if st == 'REDO':
@@ -787,7 +810,7 @@ class RearParking(Parking):
                 self._set('EXIT_SHIFT_D', now)
             return 0.0, 1.0, 0.0, R
         if st == 'EXIT_SHIFT_D':
-            if now - self.t_state > 0.5:
+            if now - self.t_state > 0.4:
                 self._set('EXIT_FWD', now)
             return 0.0, 1.0, 0.0, D
         if st == 'EXIT_FWD':
@@ -795,7 +818,7 @@ class RearParking(Parking):
             if i >= self.main_n - 3:
                 self._set('DONE', now)
                 return 0.0, 0.0, 0.0, D
-            acc, brk = self._speed(p['rpark_v_exit'], v, dt)
+            acc, brk = self._speed(self._path_speed(i, p['rpark_v_exit_fast'], p['rpark_v_exit']), v, dt)
             return acc, brk, steer, D
         return 0.0, 1.0, 0.0, D
 
