@@ -297,7 +297,7 @@ class RotaryMission(MissionBase):
             self.roll_down_m = 12.0
             self.follow_ahead_m, self.follow_margin = FOLLOW_AHEAD_M, 0.2   # 무정지 합류를 껐으므로 기존 추종 (6.5 m, NPC-0.2)
             self.t_clear, self.exit_speed, self.approach_vmax, self.go_speed = \
-                (3.4, 8.0, 8.0, 6.3) if fast_mode(opts) else (T_CLEAR, EXIT_SPEED, APPROACH_VMAX, GO_SPEED)
+                (3.1, 8.0, 8.0, 6.3) if fast_mode(opts) else (T_CLEAR, EXIT_SPEED, APPROACH_VMAX, GO_SPEED)
             if self.log and not self.enabled:
                 self.log.info('로터리 옵션이 꺼져 있어 로터리 미션을 건너뜁니다')
         if not self.enabled:
