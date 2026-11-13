@@ -1,4 +1,4 @@
-"""HEVEN 2026 MIT 기본 코드 3/3: 제어 (control). 참가자가 고칠 곳.
+"""HEVEN 2026 MIT 기본 코드 3/3: 제어 (control). 담당: 기본 주행·제어.
 
 localization.py의 /hk/local/odom(위치·방향·속력)과 planner.py의 /hk/plan/local_path(따라갈 경로)를 받아
 50 Hz로 /hk/control/command에 구동·제동·조향을 냅니다. 고칠 곳은 아래 `drive()`입니다.
@@ -12,6 +12,10 @@ localization.py의 /hk/local/odom(위치·방향·속력)과 planner.py의 /hk/p
 
 조향은 Stanley, 속력은 PI 제어입니다. 일부러 아주 단순하게 두었습니다: 굽은 길에서 속도를 줄이지 않고,
 노면·지연·경사도 따로 생각하지 않습니다. 속도를 올리거나 옵션을 켜면서 직접 고쳐 보세요.
+
+미션 직접 제어 (override): planner.py의 미션 스위치가 /hk/mission/override_cmd(CtrlCmd)를 내는 동안에는
+drive() 대신 그 명령(구동·제동·조향·기어)을 그대로 보냅니다. override_timeout_s(기본 0.2 s) 동안 새 명령이 없으면
+평소 제어(Stanley + PI)로 돌아가며, 이때 PI 적분값을 비웁니다. 미션이 아무것도 내지 않으면 원래와 똑같이 동작합니다.
 """
 import math
 
@@ -34,7 +38,9 @@ PARAMS = {
     'kp': 0.5,             # 속력 P 이득
     'ki': 0.05,            # 속력 I 이득
     'brake_gain': 0.6,     # 너무 빠를 때 제동 세기
+    'override_timeout_s': 0.2,   # 미션 직접 제어 명령이 이 시간 넘게 안 오면 평소 제어로 복귀 (s)
 }
+OVERRIDE_CMD_TOPIC = '/hk/mission/override_cmd'   # planner.py의 미션 스위치가 냄
 WHEELBASE = 3.0        # 축간 거리 (m)
 MAX_STEER = math.radians(35.4)   # steer = 1 일 때 앞바퀴 각도
 RATE_HZ = 50.0
@@ -52,9 +58,13 @@ class Control(Node):
         self.path = None
         self.active = False
         self.reset_time = None
+        self.override = None                         # (CtrlCmd, 받은 시각)
+        self.override_active = False
         self.cmd_pub = self.create_publisher(CtrlCmd, '/hk/control/command', QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
         self.create_subscription(Odometry, '/hk/local/odom', self.on_odom, 10)
         self.create_subscription(Path, '/hk/plan/local_path', self.on_path, 10)
+        self.create_subscription(CtrlCmd, OVERRIDE_CMD_TOPIC, self.on_override,
+                                 QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
         SimEvents(self, self.on_reset, self.on_end)
         self.create_timer(self.dt, self.tick)
 
@@ -62,6 +72,8 @@ class Control(Node):
     def on_reset(self, checkpoint, reload):
         self.reset_control()
         self.odom = self.path = None
+        self.override = None
+        self.override_active = False
         self.reset_time = self.now()
         self.active = True
 
@@ -88,6 +100,9 @@ class Control(Node):
         self.path = [(ps.pose.position.x, ps.pose.position.y,
                       2 * math.atan2(ps.pose.orientation.z, ps.pose.orientation.w)) for ps in m.poses]
 
+    def on_override(self, m):
+        self.override = (m, self.now())
+
     def nearest(self, x, y):
         return min(self.path, key=lambda p: math.hypot(p[0] - x, p[1] - y))
 
@@ -98,6 +113,14 @@ class Control(Node):
         if self.odom is None or self.path is None or self.now() - self.reset_time < SETTLE_S:
             self.send(0.0, 1.0, 0.0)                 # 시작·복귀 직후, 위치·경로가 아직 없으면 정지
             return
+        if self.override is not None and self.now() - self.override[1] <= self.override_timeout_s:
+            m = self.override[0]                     # 미션 직접 제어가 우선
+            self.override_active = True
+            self.send(m.accel, m.brake, m.steering, m.gear)
+            return
+        if self.override_active:                     # 직접 제어가 끝남: PI를 새로 시작
+            self.override_active = False
+            self.reset_control()
         self.send(*self.drive())
 
     def drive(self):
@@ -123,11 +146,11 @@ class Control(Node):
             return min(u, 1.0), 0.0, steer          # accel, brake, steer
         return 0.0, min(-u * self.brake_gain, 1.0), steer
 
-    def send(self, accel, brake, steer):
+    def send(self, accel, brake, steer, gear=CtrlCmd.GEAR_DRIVE):
         c = CtrlCmd()
         c.header.stamp = self.get_clock().now().to_msg()
         c.ctrl_mode = CtrlCmd.CTRL_MODE_AUTO
-        c.gear = CtrlCmd.GEAR_DRIVE
+        c.gear = int(gear)
         c.long_cmd_type = CtrlCmd.LONG_CMD_THROTTLE
         c.accel, c.brake, c.steering = float(accel), float(brake), float(steer)
         self.cmd_pub.publish(c)

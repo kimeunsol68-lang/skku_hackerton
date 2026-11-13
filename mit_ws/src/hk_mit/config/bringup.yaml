@@ -7,6 +7,7 @@ hk_mit_planner:
     ahead_m: 30.0                 # 차 앞으로 내보낼 경로 길이 (m)
     behind_m: 2.0                 # 차 뒤로 남길 경로 길이 (m)
     route_csv: ""                 # 전역 경로 (0.5 m 간격)
+    missions_enabled: true        # false: 미션 모듈(주차·장애물·로터리)을 부르지 않고 기본 경로만 따라감
 hk_mit_control:
   ros__parameters:
     target_speed: 5.0             # 목표 속력 (m/s)
@@ -15,3 +16,4 @@ hk_mit_control:
     kp: 0.5                       # 속력 P 이득
     ki: 0.05                      # 속력 I 이득
     brake_gain: 0.6               # 너무 빠를 때 제동 세기
+    override_timeout_s: 0.2       # 미션 직접 제어 명령이 이만큼(s) 안 오면 평소 제어로 복귀
