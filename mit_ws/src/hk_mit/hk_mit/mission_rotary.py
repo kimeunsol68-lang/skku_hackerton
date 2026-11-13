@@ -293,7 +293,7 @@ class RotaryMission(MissionBase):
             # 앞 NPC가 도착 시점에 12 m 이상 앞일 때만 합류, 원 안에서는 10 m 앞까지 보고 NPC보다 0.5 m/s 느리게 따라감
             self.rolling = False                # 무정지 합류: 조건 강화 후에도 NPC 충돌(seed 7 x2) -> 끔
             self.roll_down_m = 12.0
-            self.follow_ahead_m, self.follow_margin = (10.0, 0.5) if fast_mode(opts) else (FOLLOW_AHEAD_M, 0.2)
+            self.follow_ahead_m, self.follow_margin = FOLLOW_AHEAD_M, 0.2   # 무정지 합류를 껐으므로 기존 추종 (6.5 m, NPC-0.2)
             self.t_clear, self.exit_speed, self.approach_vmax, self.go_speed = \
                 (3.4, 8.0, 8.0, 6.3) if fast_mode(opts) else (T_CLEAR, EXIT_SPEED, APPROACH_VMAX, GO_SPEED)
             if self.log and not self.enabled:
