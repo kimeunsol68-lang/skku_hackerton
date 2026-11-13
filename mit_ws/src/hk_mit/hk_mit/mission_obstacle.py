@@ -67,7 +67,7 @@ NEXT_RANGE = 12.0       # A 뒷끝에서 B 앞끝까지가 이만큼(m) 이내�
 RETURN_M = 10.0         # return gently enough to keep the front corners inside the road
 RAMP_MIN = 4.2          # 코사인 전환 최소 길이 (m)
 KAPPA_LIM = 0.10        # about 10 m lane-change ramps, checked against the whole body
-SPEED_LIMIT = 3.2       # maneuver only; release the cap on the clear part of the path
+SPEED_LIMIT = 4.5       # maneuver only; ~2 m/s^2 lateral on the 0.10 1/m ramps. Was 3.2 (too slow to finish in 150 s)
 PATH_BEHIND, PATH_AHEAD, PATH_STEP = 2.0, 18.0, 0.5   # override_path 범위 (뒤차축 기준 m)
 SEARCH_BEHIND, SEARCH_AHEAD = 12, 100   # 전역 경로에서 찾는 범위 (점 번호, 0.5 m 간격)
 
@@ -235,7 +235,9 @@ class ObstacleMission(MissionBase):
             # Keep real vehicle surfaces near the lane, discard thin long boundaries.
             if abs(float(np.median(d[m]))) > 2.65:
                 continue
-            if np.ptp(s[m]) > 6.0 or np.ptp(d[m]) > 2.8:
+            # The obstacle is 4.3 m across the road. Without LiDAR noise its front face is a perfectly
+            # straight line ~3.2 m wide, which a 2.8 m width limit threw away -> obstacle never seen.
+            if np.ptp(s[m]) > 6.0 or np.ptp(d[m]) > OBSTACLE_LENGTH + 0.3:
                 continue
             out.append((float(s[m].mean()), float(d[m].mean()), float(s[m].min()), float(s[m].max()),
                         float(d[m].min()), float(d[m].max()), float(xy[m, 0].mean()), float(xy[m, 1].mean())))

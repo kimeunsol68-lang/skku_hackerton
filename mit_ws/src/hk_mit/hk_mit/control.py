@@ -102,6 +102,9 @@ PARAMS = {
     'k_heading_lowmu': 1.0,   # 저마찰 구간 방향 오차(전방 주시) 가중치
     'track_point_m': 2.6,  # Stanley가 경로에 맞추는 점: 뒤차축에서 앞으로 이만큼 (3.0 = 앞바퀴 축). 줄이면 뒤쪽이 코너 안쪽으로 덜 파고듦
     'a_lat_slope': 2.8,
+    'corner_hold_m': 8.0,           # 급커브 앞 이 거리(m) 안에서는 그 커브 속도 + margin까지만 허용 (0이면 끔)
+    'corner_hold_margin': 0.6,      # 위 허용 여유 (m/s)
+    'corner_hold_vmax': 6.0,        # 이 속도보다 느린 커브만 급커브로 봄 (m/s)
     'odom_timeout_s': 0.30,
     'path_timeout_s': 0.35,
     'diagnostic_period_s': 1.0,
@@ -453,6 +456,18 @@ class Control(Node):
                     vi, reason = self.path_vlim[i], 'mission_path'
             v.append(vi)
             reasons.append(reason)
+        if self.corner_hold_m > 0.0:                 # 급커브 직전에는 가속하지 않음: 짧은 직선에서 올린 속도를 급조향 중 제동으로 못 줄여 이탈함
+            hold = list(v)
+            j = 0
+            for i in range(n):
+                j = max(j, i)
+                while j + 1 < n and s[j + 1] - s[i] <= self.corner_hold_m:
+                    j += 1
+                m = min(v[i:j + 1])
+                if m < self.corner_hold_vmax and m + self.corner_hold_margin < hold[i]:
+                    hold[i] = m + self.corner_hold_margin
+                    reasons[i] = 'corner_hold'
+            v = hold
         for i in range(n - 2, -1, -1):               # 앞쪽 점의 속도에서 감속으로 줄일 수 있는 속도까지만 허용
             a_dec = self.a_decel_lowmu if low[i] else self.a_decel
             limit = math.sqrt(v[i + 1] ** 2 + 2.0 * a_dec * (s[i + 1] - s[i]))
