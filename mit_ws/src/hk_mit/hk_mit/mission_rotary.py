@@ -288,6 +288,7 @@ class RotaryMission(MissionBase):
             from .course import fast_mode
             # 공격 모드(2차 시도): 합류 여유를 줄이고 출구·접근·원 안 속도를 올림
             self.exit_cap_m = 20.0 if fast_mode(opts) else EXIT_CAP_M
+            self.a_decel = 3.0 if fast_mode(opts) else A_DECEL
             self.rolling = False                # 무정지 합류: NPC 충돌 3회(seed 0) -> 끔
             self.t_clear, self.exit_speed, self.approach_vmax, self.go_speed = \
                 (3.4, 8.0, 8.0, 6.3) if fast_mode(opts) else (T_CLEAR, EXIT_SPEED, APPROACH_VMAX, GO_SPEED)
@@ -374,7 +375,7 @@ class RotaryMission(MissionBase):
                 self.roll_clear = 0
 
         # 접근 속도 한계: 정지 위치까지 남은 거리에서 A_DECEL로 멈출 수 있는 속도 (V_FLOOR 이상)
-        path = self._with_limits(inp.local_path, lambda s_p: min(self.approach_vmax, max(math.sqrt(2.0 * A_DECEL * max(stop_rear - s_p, 0.0)), V_FLOOR)))
+        path = self._with_limits(inp.local_path, lambda s_p: min(self.approach_vmax, max(math.sqrt(2.0 * getattr(self, 'a_decel', A_DECEL) * max(stop_rear - s_p, 0.0)), V_FLOOR)))
         cmd = (0.0, 1.0, self._steer(inp), 'D') if at_line else None
         if cmd is not None and not self.logged_stop and self.log:
             self.log.info(f'로터리 정지선 도착 (앞 범퍼 s={s_front:.1f}, 정지 기준 {stop_front:.1f}): 정지하고 대기')
