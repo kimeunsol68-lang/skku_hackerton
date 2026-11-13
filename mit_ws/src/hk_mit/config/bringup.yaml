@@ -10,10 +10,23 @@ hk_mit_planner:
     missions_enabled: true        # false: 미션 모듈(주차·장애물·로터리)을 부르지 않고 기본 경로만 따라감
 hk_mit_control:
   ros__parameters:
-    target_speed: 5.0             # 목표 속력 (m/s)
+    # --- 속도 프로파일 (곡률 기반). 주의: launch의 target_speed 인자는 프로파일을 쓰는 동안 무시됩니다 ---
+    profile_enabled: 1.0          # 1: 곡률 기반 속도 프로파일, 0: target_speed 하나로 (예전 방식)
+    v_max: 12.0                   # 직선 최고 속도 (m/s)
+    v_min: 4.5                    # 급커브에서도 이 밑으로는 줄이지 않음 (m/s)
+    a_lat_max: 3.2                # 코너에서 허용할 횡가속도 (m/s²). 미끄러지면 낮추기 (R=7 m 코너 -> 약 4.8 m/s)
+    a_decel: 2.6                  # 코너 진입 전 미리 감속하는 세기 (m/s²). 작을수록 일찍 감속
+    curv_window_m: 3.0            # 곡률을 잴 때 앞뒤로 보는 길이 (m)
+    brake_ff_decel: 4.0           # 앞먹임 제동: brake=1일 때 감속 추정 (m/s²). 0이면 끔
+    brake_ff_lookahead_s: 0.8     # 앞먹임 제동이 내다보는 시간 (s)
+    speed_lead_s: 0.25            # 구동·제동 지연 보상: 이 시간만큼 앞의 목표 속도를 씀 (s). 지연 옵션을 끄면 0.0~0.1
+    target_speed: 5.0             # 프로파일을 끌 때(profile_enabled: 0)만 쓰는 목표 속력 (m/s)
+    # --- 지연 보상: 시뮬레이터의 지연 옵션과 맞추세요 ---
+    steer_delay_comp: 0.25        # 조향 지연 보상 (s). 조향 지연 옵션 켬(250 ms) -> 0.25, 끔 -> 0.0
+    # --- 조향 (Stanley) / 속력 (PI) ---
     k_stanley: 1.0                # Stanley: 옆으로 벗어난 거리에 대한 조향 세기
     k_soft: 1.0                   # Stanley: 저속에서 조향이 너무 세지지 않게 (m/s)
-    kp: 0.5                       # 속력 P 이득
-    ki: 0.05                      # 속력 I 이득
+    kp: 0.8                       # 속력 P 이득
+    ki: 0.08                      # 속력 I 이득
     brake_gain: 0.6               # 너무 빠를 때 제동 세기
     override_timeout_s: 0.2       # 미션 직접 제어 명령이 이만큼(s) 안 오면 평소 제어로 복귀
