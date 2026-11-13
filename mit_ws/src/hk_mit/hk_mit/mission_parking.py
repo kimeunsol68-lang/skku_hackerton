@@ -186,7 +186,13 @@ class Parking:
         c0 = self.p['park_slot_y']
         keep = (X > xs + 1.05) & (X < xs + 2.9) & (Y > c0 - 10.0) & (Y < c0 + 10.0)
         if keep.any():
-            self.pts = np.vstack([self.pts, np.column_stack([X[keep], Y[keep]])])[-20000:]
+            if getattr(self, 'slot_window', None):
+                # fast mode: only the latest scans (points mapped with older poses carry a different GNSS error;
+                # the slot came out ~0.4 m north on seed 7 and the car stopped outside it)
+                self.pscans = (getattr(self, 'pscans', []) + [np.column_stack([X[keep], Y[keep]])])[-self.slot_window:]
+                self.pts = np.vstack(self.pscans)
+            else:
+                self.pts = np.vstack([self.pts, np.column_stack([X[keep], Y[keep]])])[-20000:]
         self.scan_n += 1
         if self.p['park_debug'] > 0.5 and self.state == 'APPROACH' and self.scan_n % 10 == 1:
             d = os.path.expanduser('~/park')
@@ -999,6 +1005,9 @@ class ParkingMission(MissionBase):
         name = 'parallel_parking' if inp.cp.section == ('cp8','cp9') else 'rear_parking'
         if not option_on(options, name):
             return MissionOutput(is_done=True)
+        from .course import fast_mode
+        if fast_mode(options):
+            self.ppark.slot_window = 15                      # 공격 모드: 평행주차 칸도 최근 15 스캔으로 추정
         if inp.cp.section == ('cp8', 'cp9'):
             return self.parallel_parking(inp)
         return self.rear_parking(inp)
