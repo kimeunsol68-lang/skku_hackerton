@@ -465,7 +465,8 @@ class Parking:
             return 0.0, 1.0, 0.0, GEAR_REVERSE if self.dir < 0 else GEAR_DRIVE
         if st == 'HOLD':
             if self.t_hold0 is None:
-                self.t_hold0 = now
+                # count the 3 s from the moment the car actually stopped (v < 0.03), not after the 0.4 s stop check
+                self.t_hold0 = self.stopped_since if self.stopped_since is not None else now
             if now - self.t_hold0 >= p['park_hold_s']:
                 self.exit_a_lim = -(p['park_slot_len'] / 2) + REAR_OVERHANG + p['park_exit_rear_clear']
                 if a > self.exit_a_lim + 0.1:

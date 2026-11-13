@@ -67,7 +67,7 @@ NEXT_RANGE = 12.0       # A 뒷끝에서 B 앞끝까지가 이만큼(m) 이내�
 RETURN_M = 10.0         # return gently enough to keep the front corners inside the road
 RAMP_MIN = 4.2          # 코사인 전환 최소 길이 (m)
 KAPPA_LIM = 0.10        # about 10 m lane-change ramps, checked against the whole body
-SPEED_LIMIT = 4.0       # maneuver only (~1.6 m/s^2 lateral on the 0.10 1/m ramps). 3.2 cost ~3 s; 4.5 was not verified
+SPEED_LIMIT = 5.0       # maneuver only (0.10 1/m ramps -> 2.5 m/s^2 lateral at 5 m/s; control also caps by curvature)
 PATH_BEHIND, PATH_AHEAD, PATH_STEP = 2.0, 18.0, 0.5   # override_path 범위 (뒤차축 기준 m)
 SEARCH_BEHIND, SEARCH_AHEAD = 12, 100   # 전역 경로에서 찾는 범위 (점 번호, 0.5 m 간격)
 

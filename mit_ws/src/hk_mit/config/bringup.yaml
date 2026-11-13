@@ -47,7 +47,7 @@ hk_mit_control:
     diagnostic_period_s: 1.0
     target_speed: 5.0             # 프로파일을 끌 때(profile_enabled: 0)만 쓰는 목표 속력 (m/s)
     # --- 저마찰 구간 (course.json의 low_friction zone 안에서만 적용) ---
-    v_max_obstacle: 4.0           # = mission_obstacle SPEED_LIMIT: no hard brake when the avoidance path takes over
+    v_max_obstacle: 5.0           # = mission_obstacle SPEED_LIMIT: no hard brake when the avoidance path takes over
     obstacle_lead_m: 12.0         # 장애물 구역 입구 이만큼(m) 앞에서부터 v_max_obstacle로 달림
     lowmu_enabled: 1.0            # 1: 저마찰 구역 대응 켬, 0: 끔. 시뮬레이터 저마찰 옵션을 끄고 달릴 때는 0.0
     a_lat_lowmu: 1.3              # 1.6 slid wide into the wall on seed 1111111 (patch on the first R=8 S-bend); 1.3 = 66% of mu=0.2 limit
