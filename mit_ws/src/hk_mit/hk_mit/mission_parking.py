@@ -82,6 +82,9 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+SLOT_X_TRUE = -18.1147      # course.json 평행주차 칸 중심 x
+
+
 class Parking:
     def __init__(self, params=None, log=None):
         self.p = dict(PARAMS)
@@ -177,7 +180,7 @@ class Parking:
         cy, sy_ = math.cos(yaw), math.sin(yaw)
         X = x + bx * cy - by * sy_
         Y = y + bx * sy_ + by * cy
-        xs = self.p['park_slot_x']
+        xs = SLOT_X_TRUE                     # 감지 창은 실제 칸 중심 기준 (park_slot_x는 목표용으로 안쪽에 둘 수 있음)
         c0 = self.p['park_slot_y']
         keep = (X > xs + 1.05) & (X < xs + 2.9) & (Y > c0 - 10.0) & (Y < c0 + 10.0)
         if keep.any():
@@ -597,6 +600,9 @@ def build_path(start, prims, ds=0.1):
     return out
 
 
+GATE_SCANS = 10             # 후면주차 통로 추정에 쓰는 최근 스캔 수 (10 Hz -> 1 s)
+
+
 class RearParking(Parking):
     """후면 주차: 도로 왼쪽 벽의 틈 -> 통로(동쪽) -> 안쪽 구역에서 남쪽을 보고 선 뒤 -> 북쪽 슬롯으로 후진."""
 
@@ -611,6 +617,7 @@ class RearParking(Parking):
         self.g = None
         self.g_hits = 0
         self.gpts = np.zeros((0, 2))
+        self.gscans = []             # 최근 스캔별 통로 벽 점 (지도 좌표)
         self.main_n = 0
         self.tries = 0
         self.y_tgt = 0.0
@@ -639,7 +646,10 @@ class RearParking(Parking):
         g0 = self.p['rpark_gate_y']
         keep = (X > wx - 1.3) & (X < wx + 1.3) & (Y > g0 - 14.0) & (Y < g0 + 16.0)      # 위치 추정 오차(GNSS 노이즈)로 벽이 옆으로 어긋나 보여도 잡도록 넓게
         if keep.any():
-            self.gpts = np.vstack([self.gpts, np.column_stack([X[keep], Y[keep]])])[-20000:]
+            # Only the latest GATE_SCANS scans: points mapped with older poses carry a different GNSS error
+            # (0.3-0.6 m) and pulled the gate ~0.5 m south, steering the entry into the gate wall (seed 0).
+            self.gscans = (self.gscans + [np.column_stack([X[keep], Y[keep]])])[-GATE_SCANS:]
+            self.gpts = np.vstack(self.gscans)
         self.scan_n += 1
         if self.scan_n % 3 == 0:
             self._find_gate()
@@ -682,7 +692,7 @@ class RearParking(Parking):
             return
         center = 0.5 * (best[1] + best[2])
         self.g_hits = self.g_hits + 1 if (self.g is not None and abs(center - self.g) < 0.3) else 1
-        self.g = center if self.g is None else 0.6 * self.g + 0.4 * center
+        self.g = center if self.g is None else 0.5 * self.g + 0.5 * center
 
     def _dump_gate(self, x, y, yaw, valid):
         if self.p['park_debug'] < 0.5:

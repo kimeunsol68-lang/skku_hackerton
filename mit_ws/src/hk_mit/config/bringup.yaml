@@ -27,6 +27,8 @@ hk_mit_planner:
     park_delay: 0.25         # effective delay follows actual option
     rpark_delay: 0.25
     park_debug: 1.0
+    park_slot_x: -18.3347    # 평행주차 목표를 칸 중심(-18.1147)보다 0.22 m 안쪽(벽 쪽)으로: GNSS 오차 0.3 m + 8도 기울기로
+                             # 도로 쪽 앞 모서리가 칸 밖 0.1 m에 서서 실패한 기록(seed 0). 벽 쪽 여유는 0.5 m 남음
 hk_mit_control:
   ros__parameters:
     # --- 속도 프로파일 (곡률 기반). 주의: launch의 target_speed 인자는 프로파일을 쓰는 동안 무시됩니다 ---
