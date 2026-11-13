@@ -61,6 +61,9 @@ from .sim_events import SimEvents
 # 아래는 yaml에 값이 없을 때 쓰는 기본값입니다.
 TARGET_SPEED_DEFAULT = 5.0
 # 공격 모드 값 (2차 시도 전용). 안전 모드 값은 bringup.yaml (a_lat_max 3.0, a_lat_lowmu 1.3 ...)
+FIRST_BEND = (55.0, 76.0, -12.0, 2.0)   # 저마찰 구역 첫 S커브 (x0, x1, y0, y1)
+FIRST_BEND_A_LAT = 1.35
+
 FAST_PARAMS = {
     'a_lat_max': 3.5,       # 마른 노면 커브 (안전 3.0). 3.8 + v_max 15에서 cp2 뒤·cp5 뒤 커브 충돌
     'a_decel': 3.0,         # 커브 앞 감속 계획
@@ -462,6 +465,9 @@ class Control(Node):
         for i, c in enumerate(k):                    # 점마다 한계: 저마찰이면 더 보수적, 경사면 최고 속도 제한
             if low[i]:
                 a_lat, lo, hi = self.a_lat_lowmu, self.v_min_lowmu, min(self.v_max, self.v_max_lowmu)
+                px, py = self.path[i][0], self.path[i][1]
+                if FIRST_BEND[0] <= px <= FIRST_BEND[1] and FIRST_BEND[2] <= py <= FIRST_BEND[3]:
+                    a_lat = min(a_lat, FIRST_BEND_A_LAT)   # 첫 S커브 출구(64,-9)에서만 5번 미끄러짐: 여기만 낮춤
                 reason = 'low_friction'
             else:
                 a_lat = self.a_lat_slope if slope[i] else self.a_lat_max
