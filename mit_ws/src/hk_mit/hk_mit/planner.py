@@ -15,6 +15,7 @@
 """
 import json
 import math
+from std_msgs.msg import String
 
 import rclpy
 from rclpy.node import Node
@@ -25,15 +26,20 @@ from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import LaserScan
 from hk_interfaces.msg import CtrlCmd
 
-from .course import COURSE_DIR, declare_file_params, load_options, load_route, option_on, Route
+from .course import COURSE_DIR, declare_file_params, load_runtime_config, load_route, option_on, Route
+from .mission_parking import PARAMS as PARK_PARAMS, RPARAMS
+from .sensing import PoseHistory, fresh, stamp
 from .cp_manager import CPManager
 from .mission_manager import MissionManager
 from .sim_events import SimEvents
 
 RATE_HZ = 20.0
 PARAMS = {              # config/bringup.yaml에서 바꿉니다. 아래는 기본값
-    'ahead_m': 30.0,    # 차 앞으로 내보낼 길이 (m)
+    'ahead_m': 45.0,    # minimum preview; grows with stopping distance
     'behind_m': 2.0,    # 차 뒤로 남길 길이 (m)
+    'odom_timeout_s': 0.30,
+    'scan_timeout_s': 0.35,
+    'diagnostic_period_s': 1.0,
 }
 SETTLE_S = 0.5          # 시작·복귀 뒤 이 시간 동안은 경로 전체에서 위치를 다시 찾음 (늦게 온 예전 위치 대비)
 OVERRIDE_CMD_TOPIC = '/hk/mission/override_cmd'
@@ -48,7 +54,7 @@ class Planner(Node):
         for name, default in PARAMS.items():           # self.ahead_m, self.behind_m
             self.declare_parameter(name, default)
             setattr(self, name, float(self.get_parameter(name).value))
-        self.declare_parameter('obstacle3_speed', 2.3)       # obstacle3 구역 속도 상한 (m/s). 0이면 끔
+        self.declare_parameter('obstacle3_speed', 0.0)       # team profile excludes obstacle3
         self.declare_parameter('obstacle3_lead_m', 12.0)     # 구역 입구 이만큼(m) 앞부터 적용
         self.slow_zone = None                                # obstacle3 구역 다각형 (course.json)
         self.declare_parameter('missions_enabled', True)
@@ -61,10 +67,20 @@ class Planner(Node):
         self.obstacles = None
         self.active = False
         self.reset_time = None
-        self.create_subscription(Odometry, '/hk/local/odom', self.on_odom, 10)
+        self.history = PoseHistory()
+        self.runtime_config = None
+        self.config_ready = False
+        self.config_retry = self.last_diagnostic = -math.inf
+        self.obstacles_stamp = -math.inf
+        self.mission_parameters = {}
+        for name, default in dict(PARK_PARAMS, **RPARAMS).items():
+            self.declare_parameter(name, default)
+            self.mission_parameters[name] = self.get_parameter(name).value
+        self.create_subscription(Odometry, '/hk/local/odom', self.on_odom, 1)
         self.create_subscription(LaserScan, '/hk/sensors/lidar/scan', self.on_scan, qos_profile_sensor_data)
         self.create_subscription(PoseArray, OBSTACLES_TOPIC, self.on_obstacles, 10)
-        self.pub = self.create_publisher(Path, '/hk/plan/local_path', 10)
+        self.pub = self.create_publisher(Path, '/hk/plan/local_path', 1)
+        self.diag_pub = self.create_publisher(String, '/hk/plan/diagnostics', 1)
         self.cmd_pub = self.create_publisher(CtrlCmd, OVERRIDE_CMD_TOPIC, QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
         SimEvents(self, self.on_reset, self.on_end)
         self.create_timer(1.0 / RATE_HZ, self.plan)
@@ -76,21 +92,42 @@ class Planner(Node):
         if reload or not self.route.points:
             self.route = load_route(self)
             self.get_logger().info(f'전역 경로 {len(self.route.points)}점')
-            self.missions = self.load_missions() if self.missions_enabled else None
-            self.slow_zone = self.load_slow_zone()
+            self.configure_attempt()
         self.route.reset()
         self.checkpoint = checkpoint
         if self.missions:
             self.missions.reset(checkpoint)
-        self.odom = None
+        self.odom = self.scan = self.obstacles = None
+        self.history.clear()
+        self.obstacles_stamp = -math.inf
         self.reset_time = self.now()
         self.active = True
+
+    def configure_attempt(self):
+        self.config_retry = self.now()
+        try:
+            self.runtime_config = load_runtime_config(self.get_parameter('course_json').value or None)
+            opts = self.runtime_config['options']
+            course = self.runtime_config.get('course', {})
+            delay = float(course.get('steer_latency_ms', 250.0)) / 1000.0 if option_on(opts, 'steer_latency') else 0.0
+            self.mission_parameters.update(park_delay=delay, rpark_delay=delay)
+            self.missions = self.load_missions() if self.missions_enabled else None
+            if self.missions_enabled and self.missions is None:
+                raise ValueError('미션 초기화 실패')
+            self.slow_zone = self.load_slow_zone()
+            self.config_ready = True
+            self.get_logger().info('주행 구성: ' + json.dumps({'source': self.runtime_config['_source'],
+                'options': opts, 'parking_steer_delay_s': delay}, ensure_ascii=False))
+        except (ValueError, OSError) as error:
+            self.config_ready = False
+            self.get_logger().error(f'구성 확인 대기 (정지): {error}')
 
     def load_missions(self):
         course_json = self.get_parameter('course_json').value or str(COURSE_DIR / 'course.json')
         route_csv = self.get_parameter('route_csv').value or str(COURSE_DIR / 'route.csv')
         try:
-            return MissionManager(CPManager(course_json, route_csv), self.get_logger())
+            return MissionManager(CPManager(course_json, route_csv), self.get_logger(),
+                                  self.runtime_config['options'], self.mission_parameters)
         except Exception as e:                         # 미션 스위치가 안 떠도 기본 주행은 계속
             self.get_logger().error(f'미션 스위치를 끕니다 (CPManager 로드 실패): {e}')
             return None
@@ -99,7 +136,7 @@ class Planner(Node):
         """course.json의 obstacle3 구역 다각형. 못 읽으면 None (속도 제한만 꺼짐)."""
         if float(self.get_parameter('obstacle3_speed').value) <= 0.0:
             return None
-        if not option_on(load_options(self.get_parameter('course_json').value or None), 'obstacle3'):
+        if not option_on(self.runtime_config['options'], 'obstacle3'):
             return None                                    # 이번 시도에서 장애물 3개 옵션이 꺼져 있으면 속도를 낮출 필요 없음
         path = self.get_parameter('course_json').value or str(COURSE_DIR / 'course.json')
         try:
@@ -139,16 +176,33 @@ class Planner(Node):
         self.active = False
 
     def on_odom(self, m):
-        self.odom = m
+        if self.active and fresh(m, self.now(), self.odom_timeout_s, self.reset_time):
+            if m.twist.covariance[0] >= 1e5:
+                self.odom = None
+                return
+            self.odom = m
+            self.history.add(m)
 
     def on_scan(self, m):
-        self.scan = m
+        if self.active and fresh(m, self.now(), self.scan_timeout_s, self.reset_time):
+            self.scan = m
 
     def on_obstacles(self, m):
-        self.obstacles = [(p.position.x, p.position.y) for p in m.poses]
+        if self.active and fresh(m, self.now(), self.scan_timeout_s, self.reset_time):
+            self.obstacles = [(p.position.x, p.position.y) for p in m.poses]
+            self.obstacles_stamp = stamp(m)
 
     def plan(self):
-        if not self.active or self.odom is None or len(self.route.points) < 2:
+        if not self.active:
+            return
+        if not self.config_ready:
+            if self.now() - self.config_retry >= 1.0:
+                self.configure_attempt()
+            self.publish_path([])
+            self.publish_cmd(0.0, 1.0, 0.0, 'D')
+            return
+        if not fresh(self.odom, self.now(), self.odom_timeout_s, self.reset_time) or len(self.route.points) < 2:
+            self.publish_path([])
             return
         settling = self.now() - self.reset_time < SETTLE_S
         if settling:
@@ -158,16 +212,31 @@ class Planner(Node):
         p = self.odom.pose.pose.position
         points = self.default_path(p.x, p.y)
 
+        name, state = None, None
         if self.missions and not settling:
             q = self.odom.pose.pose.orientation
             yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
-            out, _, _ = self.missions.step(p.x, p.y, yaw, self.odom.twist.twist.linear.x, points,
-                                           self.scan, self.obstacles, self.now())
+            scan = self.scan if fresh(self.scan, self.now(), self.scan_timeout_s, self.reset_time) else None
+            scan_pose = self.history.at(stamp(scan)) if scan is not None else None
+            if scan_pose is None:
+                scan = None
+            sigma = math.sqrt(max(0.0, self.odom.pose.covariance[0], self.odom.pose.covariance[7]))
+            obstacles = self.obstacles if self.now() - self.obstacles_stamp <= self.scan_timeout_s else None
+            out, name, state = self.missions.step(p.x, p.y, yaw, self.odom.twist.twist.linear.x, points,
+                                           scan, obstacles, self.now(), scan_pose, sigma)
             if out.override_path is not None:
                 points = with_yaw(out.override_path)
             if out.override_cmd is not None:
                 self.publish_cmd(*out.override_cmd)
         self.publish_path(self.with_speed_zone(points))
+        if self.now() - self.last_diagnostic >= self.diagnostic_period_s:
+            self.last_diagnostic = self.now()
+            payload = {'t': self.now(), 'attempt_id': getattr(self, '_sim_attempt_id', ''),
+                       'section': state.section if state else None, 'mission': name,
+                       'speed': self.odom.twist.twist.linear.x,
+                       'scan_age_s': self.now() - stamp(self.scan) if self.scan else None,
+                       'path_points': len(points)}
+            self.diag_pub.publish(String(data=json.dumps(payload)))
 
     def default_path(self, x, y):
         """기본 경로: 전역 경로에서 차 뒤 behind_m ~ 앞 ahead_m. [(x, y, yaw), ...], 경로 끝을 지났으면 []."""
@@ -175,8 +244,20 @@ class Planner(Node):
         if self.route.past_end(x, y):
             return []
         first = max(0, i - int(self.behind_m / 0.5))
-        last = min(len(self.route.points), i + int(self.ahead_m / 0.5) + 1)
-        return [(*self.route.points[k], self.route.yaw_at(k)) for k in range(first, last)]
+        speed = abs(self.odom.twist.twist.linear.x) if self.odom else 0.0
+        preview = min(100.0, max(self.ahead_m, speed * 0.35 + max(0., speed**2 - 2.5**2) / 3.6 + 8.0))
+        last = min(len(self.route.points), i + int(preview / 0.5) + 1)
+        result = []
+        opts = self.runtime_config['options'] if self.runtime_config else {}
+        gates = self.missions.cp.cp_idx if self.missions else []
+        for k in range(first, last):
+            cap = 0.0
+            # Plan braking before the direct parking controller takes over.
+            for cp_index, option, limit in ((7, 'parallel_parking', 6.0), (8, 'rear_parking', 5.0)):
+                if len(gates) > cp_index and option_on(opts, option) and gates[cp_index]-10 <= k <= gates[cp_index]+12:
+                    cap = limit if cap == 0.0 else min(cap, limit)
+            result.append((*self.route.points[k], self.route.yaw_at(k), cap))
+        return result
 
     def publish_path(self, points):
         path = Path()

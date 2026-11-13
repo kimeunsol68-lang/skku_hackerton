@@ -67,7 +67,7 @@ STATIC_FRAMES = 30      # 정지물 판정에 쓰는 최근 프레임 수 (10 Hz
 STATIC_FRAC = 0.9       # 이 비율 이상의 프레임에서 같은 칸에 계속 잡히면 정지물(벽 등)로 보고 제외
 CELL_M = 0.5            # 정지물 판정용 격자 크기 (m)
 MAX_RANGE_M = 40.0
-WAIT_FAILSAFE_S = 20.0  # 이 시간 넘게 못 떠나면(감지가 잘못됐을 때) 경고 로그를 남기고 출발
+WAIT_FAILSAFE_S = 20.0  # diagnostic timeout only; never enter an occupied merge
 LOG_PERIOD_S = 1.0      # 대기 중 상태 로그 간격 (s)
 # ---- 진입 후 -----------------------------------------------------------------------------------
 GO_SPEED = 5.75         # 진입 후 속도 한계 (m/s): 5.5 ~ 6.0
@@ -103,6 +103,7 @@ class RotaryMission(MissionBase):
         self.npc_hist = deque(maxlen=8)          # (시각, 진입선까지 가장 가까운 상류 NPC 호 길이)
         self.cell_hist = deque(maxlen=STATIC_FRAMES)   # 최근 프레임들의 회전 차선 밴드 안 점이 잡힌 격자 칸
         self.last_log = -1e9
+        self.timeout_warned = False
 
     def on_enter(self, section):
         self.reset()
@@ -175,9 +176,10 @@ class RotaryMission(MissionBase):
         ang = scan.angle_min + np.arange(len(r)) * scan.angle_increment
         ok = np.isfinite(r) & (r >= max(scan.range_min, 0.3)) & (r <= min(scan.range_max, MAX_RANGE_M))
         lx, ly, lyaw = self.lidar
-        ox = inp.x + math.cos(inp.yaw) * lx - math.sin(inp.yaw) * ly
-        oy = inp.y + math.sin(inp.yaw) * lx + math.cos(inp.yaw) * ly
-        a = ang[ok] + inp.yaw + lyaw
+        x, y, heading = inp.scan_pose or (inp.x, inp.y, inp.yaw)
+        ox = x + math.cos(heading) * lx - math.sin(heading) * ly
+        oy = y + math.sin(heading) * lx + math.cos(heading) * ly
+        a = ang[ok] + heading + lyaw
         return np.stack([ox + r[ok] * np.cos(a), oy + r[ok] * np.sin(a)], axis=1)
 
     def _assess(self, xy, t):
@@ -250,7 +252,7 @@ class RotaryMission(MissionBase):
     def update(self, inp: MissionInput) -> MissionOutput:
         if self.enabled is None:                        # 옵션이 꺼져 있으면 NPC가 없으니 정지·대기하지 않음
             from .course import load_options, option_on
-            self.enabled = option_on(load_options(), 'roundabout')
+            self.enabled = option_on(getattr(self, 'options', None) or load_options(), 'roundabout')
             if self.log and not self.enabled:
                 self.log.info('로터리 옵션이 꺼져 있어 로터리 미션을 건너뜁니다')
         if not self.enabled:
@@ -300,9 +302,11 @@ class RotaryMission(MissionBase):
                 if self.log and inp.t - self.last_log >= LOG_PERIOD_S:
                     self.last_log = inp.t
                     self.log.info(f'로터리 대기 {inp.t - self.wait_since:.0f}s: ' + self._fmt(a))
-            if self.clear_frames >= CLEAR_FRAMES or inp.t - self.wait_since > WAIT_FAILSAFE_S:
-                if inp.t - self.wait_since > WAIT_FAILSAFE_S and self.log:
-                    self.log.warn(f'로터리 대기 {WAIT_FAILSAFE_S:.0f}s가 넘어 그냥 출발합니다 (NPC 감지 확인 필요)')
+            if inp.t - self.wait_since > WAIT_FAILSAFE_S and not self.timeout_warned:
+                self.timeout_warned = True
+                if self.log:
+                    self.log.warn('로터리 대기 장기화: 위험 구간이 비었다는 새 관측이 있어야 출발합니다')
+            if self.clear_frames >= CLEAR_FRAMES and new_frame:
                 self.entered = True
                 if self.log:
                     self.log.info('로터리 빈 공간 확인: 진입')

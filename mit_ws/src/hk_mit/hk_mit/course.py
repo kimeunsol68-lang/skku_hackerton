@@ -14,25 +14,32 @@ COURSE_DIR = Path(get_package_share_directory('hk_mit')) / 'course'
 CURRENT_COURSE = Path('/data/current/course.json')   # 시뮬레이터가 시도마다 새로 쓰는 코스 파일 (컨테이너 안). 켜진 옵션이 들어 있음
 
 
-def load_options(path=None):
-    """이번 시도에서 켜진 옵션 {이름: bool} (예: 'low_friction', 'obstacle3', 'roundabout'). 읽을 수 없으면 None.
-    None이면 호출한 쪽은 모든 구역 대응을 켠 채로(가장 보수적으로) 동작합니다. 패키지에 들어 있는 기본 course.json에는
-    options가 없으므로(config 'none') 그 파일은 None으로 봅니다."""
+def load_runtime_config(path=None):
+    """Public per-attempt configuration. Missing options are an error, not 'all on'."""
     for p in ([Path(path)] if path else []) + [CURRENT_COURSE]:
         try:
-            with open(p, encoding='utf-8') as f:
-                d = json.load(f)
-        except (OSError, ValueError):
+            d = json.loads(p.read_text(encoding='utf-8'))
+            opts = d.get('options')
+            if isinstance(opts, dict) and opts:
+                d['options'] = {str(k): v for k, v in opts.items()}
+                d['_source'] = str(p)
+                return d
+        except (OSError, ValueError, AttributeError):
             continue
-        opts = d.get('options')
-        if isinstance(opts, dict) and opts:
-            return {str(k): bool(v) for k, v in opts.items()}
-    return None
+    raise ValueError('이번 시도의 options 파일을 읽지 못했습니다. 새 연습 시작 후 다시 확인합니다.')
+
+
+def load_options(path=None):
+    """이번 시도의 옵션. 실패 시 None; 주행 노드는 재시도하며 정지합니다."""
+    try:
+        return load_runtime_config(path)['options']
+    except ValueError:
+        return None
 
 
 def option_on(options, name):
-    """options가 None(모름)이면 True, 알면 그 옵션이 켜졌는지."""
-    return True if options is None else bool(options.get(name, False))
+    """알려진 활성 옵션만 실행합니다. 모르는 구성으로 주행하지 않습니다."""
+    return options is not None and bool(options.get(name, False))
 
 
 def declare_file_params(node):

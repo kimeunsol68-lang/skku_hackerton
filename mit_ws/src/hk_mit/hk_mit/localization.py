@@ -19,7 +19,7 @@ from geometry_msgs.msg import TransformStamped, TwistStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, NavSatFix
 from tf2_ros import TransformBroadcaster
-from .course import declare_file_params, load_course
+from .course import declare_file_params, load_course, load_runtime_config, option_on
 from .sim_events import SimEvents
 from .utm import ll_to_map
 
@@ -211,6 +211,12 @@ class PoseFilter:
         speed, _ = self.motion(timestamp)
         if abs(speed) < 0.3:
             gain[2:4, :] = 0.0  # 정지 중 위치 잡음으로 방향·자이로 편향을 바꾸지 않음
+        if (self.still_since is not None and timestamp - self.still_since >= 0.25
+                and self.wheel_time is not None and timestamp-self.wheel_time < 0.1
+                and abs(speed) < 0.04):
+            # A stopped car must not wander in the parking slot as GPS jitters.
+            # Keep map pose fixed; the slow GNSS bias can still be estimated.
+            gain[:4, :] = 0.0
         delta = gain @ innovation
         scale = min(1.0, self.cfg['max_gps_step'] / max(np.linalg.norm(delta[:2]), 1e-12),
                     math.radians(1.0) / max(abs(delta[2]), 1e-12))
@@ -299,6 +305,10 @@ class Localization(Node):
                 raise ValueError(f'{name} must be finite and positive')
             self.cfg[name] = value
         self.course = None
+        self.base_cfg = dict(self.cfg)
+        self.declare_parameter('auto_sensor_noise', True)
+        self.runtime_ready = False
+        self.config_retry = -math.inf
         self.reset(None)
         self.create_subscription(NavSatFix, '/hk/sensors/gps/fix', self.on_gps, qos_profile_sensor_data)
         self.create_subscription(Imu, '/hk/sensors/imu/data', self.on_imu, qos_profile_sensor_data)
@@ -309,11 +319,32 @@ class Localization(Node):
         self.create_timer(1.0 / RATE_HZ, self.publish)
 
     def on_reset(self, checkpoint, reload):
+        self.checkpoint = checkpoint
         if self.ready:
             self.log_diagnostics('RESPAWN/START')
         if reload or self.course is None:
             self.course = load_course(self)
+            self.configure_noise()
         self.reset(self.course.pose(checkpoint))
+
+    def configure_noise(self):
+        self.config_retry = self.get_clock().now().nanoseconds * 1e-9
+        try:
+            runtime = load_runtime_config(self.get_parameter('course_json').value or None)
+            self.cfg = dict(self.base_cfg)
+            if self.get_parameter('auto_sensor_noise').value:
+                options, sensors = runtime['options'], runtime.get('course', {}).get('sensors', {})
+                if not option_on(options, 'gnss_noise'):
+                    self.cfg.update(gps_sigma=0.04, gps_bias_sigma=0.02)
+                else:
+                    self.cfg['gps_bias_sigma'] = max(self.cfg['gps_bias_sigma'], float(sensors.get('gnss_multipath_sigma', 0.3)))
+                if not option_on(options, 'imu_noise'):
+                    self.cfg.update(gyro_noise=0.0002, bias_walk=0.00002)
+            self.runtime_ready = True
+            self.get_logger().info(f'위치 추정 잡음 설정: gps_sigma={self.cfg["gps_sigma"]:.3f}, gps_bias_sigma={self.cfg["gps_bias_sigma"]:.3f}')
+        except ValueError as error:
+            self.runtime_ready = False
+            self.get_logger().error(f'위치 추정 구성 확인 대기: {error}')
 
     def on_end(self):
         if self.ready:
@@ -378,6 +409,12 @@ class Localization(Node):
             return
         clock = self.get_clock().now()
         now = clock.nanoseconds * 1e-9
+        if not self.runtime_ready:
+            if now - self.config_retry >= 1.0:
+                self.configure_noise()
+                if self.runtime_ready:
+                    self.reset(self.course.pose(self.checkpoint))
+            return
         if now < self.last_clock - 1e-6:
             self.ready = False
             self.queue.clear()
@@ -410,6 +447,10 @@ class Localization(Node):
             message.pose.covariance[axis * 6 + axis] = 1e6
         message.twist.covariance[0] = 0.15**2
         message.twist.covariance[35] = float(covariance[3, 3] + 0.01**2)
+        if any(t is None or now-t > self.cfg['sensor_timeout']
+               for t in (self.filter.wheel_time, self.filter.imu_time)):
+            # A fresh ROS header is not proof of fresh motion sensors.
+            message.twist.covariance[0] = 1e6
         self.pub.publish(message)
         transform = TransformStamped()
         transform.header = message.header

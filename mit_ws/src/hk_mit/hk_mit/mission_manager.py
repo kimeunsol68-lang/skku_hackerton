@@ -11,16 +11,23 @@ from .mission_base import GEARS, MissionInput, MissionOutput
 from .mission_obstacle import ObstacleMission
 from .mission_parking import ParkingMission
 from .mission_rotary import RotaryMission
+from .course import load_options, option_on
 
 MISSIONS = (ParkingMission, ObstacleMission, RotaryMission)
+SECTION_OPTIONS = {('cp1', 'cp2'): 'obstacle1', ('cp6', 'cp7'): 'obstacle3',
+                   ('cp8', 'cp9'): 'parallel_parking', ('cp9', 'cp10'): 'rear_parking',
+                   ('cp5', 'cp6'): 'roundabout'}
 ERROR_LOG_PERIOD_S = 1.0
 
 
 class MissionManager:
-    def __init__(self, cp_manager, logger=None):
+    def __init__(self, cp_manager, logger=None, options=None, parameters=None):
         self.cp = cp_manager
         self.log = logger
         self.missions = [cls(logger) for cls in MISSIONS]
+        self.options = dict(options if options is not None else (load_options() or {}))
+        for m in self.missions:
+            m.configure(self.options, parameters)
         self.checkpoint = 0
         self.reset(0)
 
@@ -31,33 +38,46 @@ class MissionManager:
         self.section = None
         self.done = set()
         self.last_error = {}
+        self.last_gear = 'D'
         for m in self.missions:
             self._safe(m, 'reset', 0.0, m.reset)
 
-    def step(self, x, y, yaw, speed, local_path, scan, obstacles, t):
+    def step(self, x, y, yaw, speed, local_path, scan, obstacles, t, scan_pose=None, pose_sigma=0.0):
         """(MissionOutput, 실행한 미션 이름 또는 None, CPState)."""
         state = self.cp.update(x, y, yaw)
         sec = state.section
+        enabled = option_on(self.options, SECTION_OPTIONS.get(sec, ''))
         if sec != self.section:
             self.section = sec
             self.done = set()                      # 새 구간에 들어오면 완료 기록을 지움
             if self.log:
                 self.log.info(f'CP 구간 {sec[0]} -> {sec[1]}')
             for m in self.missions:
-                if sec in m.SECTIONS:
+                if enabled and sec in m.SECTIONS:
                     self._safe(m, 'on_enter', t, m.on_enter, sec)
         info = state.missions[0] if state.missions else {}
+        if not enabled:
+            return MissionOutput(), None, state
+        if scan is None:
+            return MissionOutput(override_cmd=(0.0, 1.0, 0.0, self.last_gear)), 'waiting_for_scan', state
         inp = None
         for m in self.missions:
             if sec not in m.SECTIONS or (m.NAME, sec) in self.done:
                 continue
             if inp is None:
-                inp = MissionInput(x, y, yaw, speed, local_path, scan, obstacles, t, state, info)
+                # MissionInput's established contract is (x,y,yaw). Planner
+                # speed metadata must not break parking/rotary tuple unpacking.
+                mission_path = [tuple(p[:3]) for p in local_path]
+                inp = MissionInput(x, y, yaw, speed, mission_path, scan, obstacles, t, state, info, scan_pose, pose_sigma)
             out = self._safe(m, 'update', t, m.update, inp)
             if not isinstance(out, MissionOutput):
-                continue
-            out = MissionOutput(self._check_path(m, out.override_path, t),
-                                self._check_cmd(m, out.override_cmd, t), bool(out.is_done))
+                return MissionOutput(override_cmd=(0.0, 1.0, 0.0, self.last_gear)), m.NAME + '_error', state
+            path, cmd = self._check_path(m, out.override_path, t), self._check_cmd(m, out.override_cmd, t)
+            if (out.override_path is not None and path is None) or (out.override_cmd is not None and cmd is None):
+                return MissionOutput(override_cmd=(0.0, 1.0, 0.0, self.last_gear)), m.NAME + '_error', state
+            out = MissionOutput(path, cmd, bool(out.is_done))
+            if cmd is not None:
+                self.last_gear = cmd[3]
             if out.is_done:
                 self.done.add((m.NAME, sec))
                 if self.log:

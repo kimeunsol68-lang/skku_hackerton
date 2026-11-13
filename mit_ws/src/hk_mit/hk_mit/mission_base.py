@@ -44,6 +44,8 @@ class MissionInput:
     t: float = 0.0
     cp: Any = None                                          # cp_manager.CPState
     info: dict = field(default_factory=dict)
+    scan_pose: Optional[Tuple[float, float, float]] = None  # map pose at scan.header.stamp
+    pose_sigma: float = 0.0
 
 
 @dataclass
@@ -66,6 +68,11 @@ class MissionBase:
 
     def on_enter(self, section):
         """SECTIONS 중 한 구간에 들어올 때 한 번 불립니다. section = ('cp8', 'cp9') 등."""
+
+    def configure(self, options, parameters=None):
+        """Same immutable START snapshot for every mission; reset preserves it."""
+        self.options = dict(options)
+        self.parameters = dict(parameters or {})
 
     def update(self, inp: MissionInput) -> MissionOutput:
         """20 Hz. 기본값(아무것도 바꾸지 않음)을 돌려줍니다."""

@@ -13,6 +13,8 @@ from hk_interfaces.msg import SimEvent
 class SimEvents:
     def __init__(self, node, on_reset, on_end):
         self.on_reset, self.on_end = on_reset, on_end
+        self.node = node
+        self.attempt = None
         self.active = False
         self.seen, self.ended = set(), set()
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -23,13 +25,23 @@ class SimEvents:
             return
         self.seen.add((ev.attempt_id, ev.event_id))
         if ev.kind == SimEvent.START:
+            if ev.attempt_id in self.ended:
+                return
+            self.attempt = ev.attempt_id
+            self.node._sim_attempt_id = ev.attempt_id
             self.active = True
             self.on_reset(ev.checkpoint, True)
         elif ev.kind == SimEvent.RESPAWN and ev.attempt_id not in self.ended:
+            if self.active and self.attempt != ev.attempt_id:
+                return
             reload = not self.active
+            self.attempt = ev.attempt_id
+            self.node._sim_attempt_id = ev.attempt_id
             self.active = True
             self.on_reset(ev.checkpoint, reload)
         elif ev.kind == SimEvent.END:
             self.ended.add(ev.attempt_id)
+            if self.attempt is not None and ev.attempt_id != self.attempt:
+                return
             self.active = False
             self.on_end()

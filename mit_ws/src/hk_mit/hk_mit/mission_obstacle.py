@@ -38,12 +38,14 @@ import math
 import numpy as np
 
 from .mission_base import MissionBase, MissionInput, MissionOutput
+from .course import load_options, option_on
+from .sensing import stamp
 
 # ---- 차량·센서 (IONIQ 5) -------------------------------------------------------------------------
 LIDAR_X, LIDAR_Y, LIDAR_YAW = 1.15, 0.0, 0.0     # 뒤차축 기준 (config/sensor_mounts.yaml에서 읽고, 못 읽으면 이 값)
 FRONT_OVERHANG = 3.845                           # 뒤차축에서 앞 범퍼까지 (m) = 4.635 - 0.79
 # ---- 감지·추적 ---------------------------------------------------------------------------------
-D_FILTER = 3.2          # 중심선에서 이 안쪽 점만 장애물 후보 (m). 도로 벽(약 4.25 m)은 제외
+D_FILTER = 2.75         # remove boundary points BEFORE clustering so they cannot join a real car
 BEHIND_M = 1.5          # 차 뒤 이만큼까지 (m)
 AHEAD_M = 24.0          # 차 앞 이만큼까지 (m). 앞 장애물에 가려진 다음 장애물의 윤곽이 조금이라도 보이면 바로 추적 시작
 MAX_RANGE_M = 40.0      # LiDAR 점 최대 거리 (m)
@@ -53,8 +55,8 @@ MIN_POINTS = 3          # 이보다 적은 묶음은 노이즈
 ASSOC_DIST = 1.8        # 추적 중인 장애물과 같은 물체로 보는 거리 (m)
 ASSOC_PAD = 0.8         # 추적 중인 장애물의 범위 안팎 이만큼 이내에 들어오면 같은 물체 (m)
 NEW_MIN_AHEAD = 0.3     # 새 장애물은 차보다 이만큼 앞에서만 만듦 (지나친 장애물의 뒷면 조각이 새 장애물이 되는 것 방지)
-CONFIRM_COUNT = 1       # 3점 이상 클러스터가 한 프레임이라도 잡히면 즉시 확정
-CULL_BEHIND = 8.0       # 뒷끝을 이만큼 지나치면 추적 목록에서 삭제 (m). 가려져서 점이 안 들어와도 지나치기 전에는 지우지 않음(기억 유지)
+CONFIRM_COUNT = 2       # two distinct sensor frames, never duplicate planner ticks
+CULL_BEHIND = 12.0      # retain the vehicle until the longer return ramp is complete
 # ---- 회피 경로 ---------------------------------------------------------------------------------
 LANE_OFFSET = 2.05      # 회피 목표 오프셋 (m), 항상 ±2.05 유지
 OBSTACLE_LENGTH = 4.3   # 장애물 실제 길이 (m). LiDAR는 앞면·옆면 일부만 보므로 smax가 실제 뒷끝보다 짧게 잡힘
@@ -62,10 +64,10 @@ MARGIN_FRONT = 1.5      # 앞 오버행(3.845 m) 말고 더 두는 앞쪽 여유
 PASS_MARGIN = 0.5       # 장애물 뒷면(s_max)에서 이만큼 지나면 다음 목표로 넘어가기 시작 (m)
 DROP_MARGIN = 1.2       # 뒤차축이 s_max + 이만큼 지나면 후보에서 제외 (m)
 NEXT_RANGE = 12.0       # A 뒷끝에서 B 앞끝까지가 이만큼(m) 이내면 B는 A에서 바로 이어서 회피
-RETURN_M = 4.5          # 다음 장애물이 없을 때 중앙으로 복귀하는 길이 (m)
+RETURN_M = 10.0         # return gently enough to keep the front corners inside the road
 RAMP_MIN = 4.2          # 코사인 전환 최소 길이 (m)
-KAPPA_LIM = 0.22        # 경로 곡률 한계 (1/m). 축거 3 m, 최대 조향 35.4°에서 0.237
-SPEED_LIMIT = 3.5       # 회피 구간 속도 한계 (m/s). 2.7에서 올림
+KAPPA_LIM = 0.10        # about 10 m lane-change ramps, checked against the whole body
+SPEED_LIMIT = 3.2       # maneuver only; release the cap on the clear part of the path
 PATH_BEHIND, PATH_AHEAD, PATH_STEP = 2.0, 18.0, 0.5   # override_path 범위 (뒤차축 기준 m)
 SEARCH_BEHIND, SEARCH_AHEAD = 12, 100   # 전역 경로에서 찾는 범위 (점 번호, 0.5 m 간격)
 
@@ -77,15 +79,18 @@ class Track:
         self.s, self.d, self.x, self.y = s, d, x, y
         self.smin, self.smax, self.dmin, self.dmax = smin, smax, dmin, dmax
         self.count, self.t, self.side = 1, t, 0
+        self.offset = LANE_OFFSET
 
     def update(self, s, d, smin, smax, dmin, dmax, x, y, t, alpha=0.3):
         self.s += alpha * (s - self.s)
         self.d += alpha * (d - self.d)
         self.x += alpha * (x - self.x)
         self.y += alpha * (y - self.y)
-        self.smin, self.smax = min(self.smin, smin), max(self.smax, smax)
-        self.dmin, self.dmax = min(self.dmin, dmin), max(self.dmax, dmax)
-        self.count += 1
+        self.smin, self.smax = (min(self.smin, smin), min(max(self.smax, smax), min(self.smin, smin) + 5.5))
+        self.dmin = 0.7 * self.dmin + 0.3 * dmin
+        self.dmax = 0.7 * self.dmax + 0.3 * dmax
+        if t > self.t + 1e-4:
+            self.count += 1
         self.t = t
 
     @property
@@ -109,7 +114,7 @@ class Track:
 
     def target(self):
         """회피 목표 오프셋: 장애물이 왼쪽(side>0)이면 오른쪽(-) 차선."""
-        return -LANE_OFFSET * self.side
+        return -self.offset * self.side
 
 
 class ObstacleMission(MissionBase):
@@ -124,9 +129,12 @@ class ObstacleMission(MissionBase):
     def reset(self):
         self.tracks = []
         self.zone_box = None
+        self.last_scan_stamp = None
+        self.zone_half_width = 3.75
+        self.last_warning = -math.inf
 
     def on_enter(self, section):
-        self.zone_box = None       # 새 구간의 zone을 다시 고름. 추적 중인 장애물은 구간이 바뀌어도 유지
+        self.reset()
 
     # ---- 준비 ---------------------------------------------------------------------------------------
     def _load(self):
@@ -172,9 +180,10 @@ class ObstacleMission(MissionBase):
         if not ok.any():
             return []
         lx, ly, lyaw = self.lidar
-        ox = inp.x + math.cos(inp.yaw) * lx - math.sin(inp.yaw) * ly
-        oy = inp.y + math.sin(inp.yaw) * lx + math.cos(inp.yaw) * ly
-        a = ang[ok] + inp.yaw + lyaw
+        x, y, heading = inp.scan_pose or (inp.x, inp.y, inp.yaw)
+        ox = x + math.cos(heading) * lx - math.sin(heading) * ly
+        oy = y + math.sin(heading) * lx + math.cos(heading) * ly
+        a = ang[ok] + heading + lyaw
         xy = np.stack([ox + r[ok] * np.cos(a), oy + r[ok] * np.sin(a)], axis=1)
         i0, i1 = max(0, ego_i - SEARCH_BEHIND), min(len(self.pts), ego_i + SEARCH_AHEAD)
         _, s, d, inner = self._frenet(xy, i0, i1)
@@ -182,6 +191,21 @@ class ObstacleMission(MissionBase):
         if self.zone_box is not None:
             x0, x1, y0, y1 = self.zone_box
             keep &= (xy[:, 0] >= x0) & (xy[:, 0] <= x1) & (xy[:, 1] >= y0) & (xy[:, 1] <= y1)
+        # A localization offset can move an entire wall inside D_FILTER. Peel
+        # long narrow boundary lines BEFORE connected components; rejecting a
+        # whole merged component would also discard a car beside that wall.
+        for side in (-1, 1):
+            edge = keep & (side*d > 2.15)
+            if edge.sum() < 10 or np.ptp(s[edge]) < 8.0:
+                continue
+            inliers = edge.copy()
+            for _ in range(3):
+                if inliers.sum() < 8 or np.ptp(s[inliers]) < 8.0:
+                    break
+                line = np.polyfit(s[inliers], d[inliers], 1)
+                inliers = edge & (np.abs(d - np.polyval(line, s)) < 0.16)
+            if inliers.sum() >= 8 and np.ptp(s[inliers]) >= 8.0:
+                keep &= ~((side*d > 1.8) & (np.abs(d - np.polyval(line, s)) < 0.18))
         xy, s, d = xy[keep], s[keep], d[keep]
         n = len(xy)
         if n < MIN_POINTS:
@@ -207,28 +231,41 @@ class ObstacleMission(MissionBase):
             if len(members) < MIN_POINTS:
                 continue
             m = np.asarray(members)
+            # The wall at |d|~3.1 was repeatedly treated as a second car.
+            # Keep real vehicle surfaces near the lane, discard thin long boundaries.
+            if abs(float(np.median(d[m]))) > 2.65:
+                continue
+            if np.ptp(s[m]) > 6.0 or np.ptp(d[m]) > 2.8:
+                continue
             out.append((float(s[m].mean()), float(d[m].mean()), float(s[m].min()), float(s[m].max()),
                         float(d[m].min()), float(d[m].max()), float(xy[m, 0].mean()), float(xy[m, 1].mean())))
         return out
 
     # ---- 추적 ---------------------------------------------------------------------------------------
     def _track(self, detections, s_ego, t):
+        matched = set()
         for det in detections:
             best, best_score = None, ASSOC_DIST
             for tr in self.tracks:
+                if id(tr) in matched:
+                    continue
                 score = 0.0 if tr.contains(det[0], det[1]) else math.hypot(tr.s - det[0], tr.d - det[1])
                 if score < best_score:
                     best, best_score = tr, score
             if best is not None:
                 best.update(*det, t)
+                matched.add(id(best))
             elif det[0] >= s_ego + NEW_MIN_AHEAD:
-                self.tracks.append(Track(*det, t))
+                tr = Track(*det, t)
+                self.tracks.append(tr)
+                matched.add(id(tr))
         for tr in self.tracks:
             if tr.confirmed and tr.side == 0:                           # 확정 때 회피 방향을 고정
                 tr.side = 1 if tr.d >= 0.0 else -1
                 if self.log:
                     self.log.info(f'장애물 확정 s={tr.s:.1f} d={tr.d:+.2f} -> {"오른쪽" if tr.side > 0 else "왼쪽"} 차선으로 회피')
-        self.tracks = [tr for tr in self.tracks if s_ego < tr.back() + CULL_BEHIND]
+        self.tracks = [tr for tr in self.tracks if s_ego < tr.back() + CULL_BEHIND
+                       and t - tr.t < (5.0 if tr.confirmed else 0.45)]
 
     # ---- 회피 곡선 ----------------------------------------------------------------------------------
     @staticmethod
@@ -284,6 +321,13 @@ class ObstacleMission(MissionBase):
 
     # ---- 메인 ---------------------------------------------------------------------------------------
     def update(self, inp: MissionInput) -> MissionOutput:
+        options = getattr(self, 'options', None)
+        if options is None:
+            options = load_options()
+        option = 'obstacle3' if inp.cp and inp.cp.section == ('cp6', 'cp7') else 'obstacle1'
+        if not option_on(options, option):
+            self.reset()
+            return MissionOutput(is_done=True)
         if self.pts is None:
             self._load()
         if self.zone_box is None:                       # 이 구간의 앞뒤 CP를 입구로 하는 장애물 zone (course.json)
@@ -293,6 +337,7 @@ class ObstacleMission(MissionBase):
                     zx = [p[0] for p in m['zone']]
                     zy = [p[1] for p in m['zone']]
                     self.zone_box = (min(zx) - ZONE_MARGIN_M, max(zx) + ZONE_MARGIN_M, min(zy) - ZONE_MARGIN_M, max(zy) + ZONE_MARGIN_M)
+                    self.zone_half_width = min(max(zx)-min(zx), max(zy)-min(zy)) / 2.0
             if self.zone_box is None:
                 return MissionOutput()
         ego_i = inp.cp.index if inp.cp is not None else int(np.argmin(np.hypot(*(self.pts - [inp.x, inp.y]).T)))
@@ -300,8 +345,12 @@ class ObstacleMission(MissionBase):
         rel = np.array([inp.x, inp.y]) - self.pts[ego_i]
         s_ego = float(self.s[ego_i] + rel @ self.tan[ego_i])
 
-        self._track(self._detect(inp, ego_i, s_ego), s_ego, inp.t)
+        if inp.scan is not None and stamp(inp.scan) != self.last_scan_stamp:
+            self.last_scan_stamp = stamp(inp.scan)
+            self._track(self._detect(inp, ego_i, s_ego), s_ego, stamp(inp.scan))
         known = [tr for tr in self.tracks if tr.confirmed and tr.side != 0]
+        for tr in known:
+            tr.offset = min(LANE_OFFSET, self.zone_half_width - 1.892/2 - 0.20)
         # 타겟 선택: 아직 안 지나친 장애물 중 가장 가까운 1개(A), 바로 뒤 12 m 이내에 보이는 다음 1개(B)
         ahead = sorted((tr for tr in known if s_ego < tr.back() + DROP_MARGIN), key=lambda tr: tr.smin)
         elems = []
@@ -330,5 +379,38 @@ class ObstacleMission(MissionBase):
         dxy = np.diff(new, axis=0)
         yaw = np.arctan2(dxy[:, 1], dxy[:, 0])
         yaw = np.append(yaw, yaw[-1])
-        path = [(float(x), float(y), float(h), SPEED_LIMIT) for (x, y), h in zip(new, yaw)]
+        # Check the swept body, not only the rear-axle centre. Stop if the
+        # observed obstacle/road geometry cannot accommodate this maneuver.
+        route_heading = np.arctan2(np.interp(s_grid, self.s, self.tan[:, 1]),
+                                   np.interp(s_grid, self.s, self.tan[:, 0]))
+        rel = yaw - route_heading
+        safe = True
+        safety_reason = ''
+        margin = 0.15 + min(0.15, max(0.0, inp.pose_sigma) * 0.4)
+        for front in (-0.79, FRONT_OVERHANG):
+            for side in (-1.892/2, 1.892/2):
+                corner_d = off + front*np.sin(rel) + side*np.cos(rel)
+                if np.any(np.abs(corner_d) > self.zone_half_width - margin):
+                    safe = False
+                    safety_reason = f'도로 여유 (모서리 {np.max(np.abs(corner_d)):.2f}, 한계 {self.zone_half_width-margin:.2f}m)'
+        # Conservative rectangle projection at each path sample against each
+        # confirmed vehicle. This does not use true/simulator object positions.
+        half_width = 1.892 / 2.0
+        s_min = s_grid + np.minimum(-.79*np.cos(rel), FRONT_OVERHANG*np.cos(rel)) - half_width*np.abs(np.sin(rel))
+        s_max = s_grid + np.maximum(-.79*np.cos(rel), FRONT_OVERHANG*np.cos(rel)) + half_width*np.abs(np.sin(rel))
+        d_min = off + np.minimum(-.79*np.sin(rel), FRONT_OVERHANG*np.sin(rel)) - half_width*np.abs(np.cos(rel))
+        d_max = off + np.maximum(-.79*np.sin(rel), FRONT_OVERHANG*np.sin(rel)) + half_width*np.abs(np.cos(rel))
+        for tr in known:
+            overlap = (s_max > tr.smin-margin) & (s_min < tr.back()+margin)
+            if np.any(overlap & (d_max > tr.dmin-margin) & (d_min < tr.dmax+margin)):
+                safe = False
+                safety_reason = f'장애물 여유 s={tr.s:.1f}, d={tr.d:.2f}'
+        if not safe:
+            if self.log and inp.t - self.last_warning > 1.0:
+                self.log.warn('회피 경로 차체 여유 부족: ' + safety_reason)
+                self.last_warning = inp.t
+            return MissionOutput(override_cmd=(0.0, 1.0, 0.0, 'D'))
+        end_maneuver = max(tr.hi() + RETURN_M for tr in elems)
+        path = [(float(x), float(y), float(h), SPEED_LIMIT if s <= end_maneuver else 0.0)
+                for (x, y), h, s in zip(new, yaw, s_grid)]
         return MissionOutput(override_path=path)

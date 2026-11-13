@@ -51,8 +51,10 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from nav_msgs.msg import Odometry, Path
 from hk_interfaces.msg import CtrlCmd
+from std_msgs.msg import String
 
-from .course import COURSE_DIR, load_options, option_on
+from .course import COURSE_DIR, load_runtime_config, option_on
+from .sensing import fresh, stamp, predict_motion
 from .sim_events import SimEvents
 
 # 조정할 값은 config/bringup.yaml의 파라미터입니다(공식 주행 직전에는 코드가 아니라 이 파일만 바꿀 수 있음).
@@ -99,6 +101,11 @@ PARAMS = {
     'k_soft_lowmu': 0.3,   # 저마찰 구간 Stanley 저속 완화값 (m/s). 작을수록 저속에서 더 적극적
     'k_heading_lowmu': 1.0,   # 저마찰 구간 방향 오차(전방 주시) 가중치
     'track_point_m': 2.6,  # Stanley가 경로에 맞추는 점: 뒤차축에서 앞으로 이만큼 (3.0 = 앞바퀴 축). 줄이면 뒤쪽이 코너 안쪽으로 덜 파고듦
+    'a_lat_slope': 2.8,
+    'odom_timeout_s': 0.30,
+    'path_timeout_s': 0.35,
+    'diagnostic_period_s': 1.0,
+    'auto_latency': 1.0,
 }
 OVERRIDE_CMD_TOPIC = '/hk/mission/override_cmd'   # planner.py의 미션 스위치가 냄
 WHEELBASE = 3.0        # 축간 거리 (m)
@@ -128,11 +135,21 @@ class Control(Node):
         self._braking = False                        # 구동/제동 전환 히스테리시스 상태
         self._u_sat = 0.0
         self.declare_parameter('course_json', '')    # 저마찰·경사 구간 좌표 파일. 비우면 패키지의 course/course.json
-        self.zones = self.load_zones()
+        self.zones = {}
+        self.runtime_config = None
+        self.config_ready = False
+        self.config_retry = self.last_diagnostic = -math.inf
+        self.last_command_gear = CtrlCmd.GEAR_DRIVE
+        self.measured_acceleration = 0.0
+        self.last_speed_sample = None
+        self.target = 0.0
+        self.target_reason = 'waiting'
+        self.cross_error = self.heading_error = 0.0
         self.steer_hist = deque()                    # (보낸 시각, 앞바퀴 각도 rad): 아직 차에 닿지 않은 조향 명령 포함
         self.cmd_pub = self.create_publisher(CtrlCmd, '/hk/control/command', QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
-        self.create_subscription(Odometry, '/hk/local/odom', self.on_odom, 10)
-        self.create_subscription(Path, '/hk/plan/local_path', self.on_path, 10)
+        self.diag_pub = self.create_publisher(String, '/hk/control/diagnostics', 1)
+        self.create_subscription(Odometry, '/hk/local/odom', self.on_odom, 1)
+        self.create_subscription(Path, '/hk/plan/local_path', self.on_path, 1)
         self.create_subscription(CtrlCmd, OVERRIDE_CMD_TOPIC, self.on_override,
                                  QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
         SimEvents(self, self.on_reset, self.on_end)
@@ -141,15 +158,36 @@ class Control(Node):
     # ---- 시작·복귀 -----------------------------------------------------------------------------------
     def on_reset(self, checkpoint, reload):
         if reload:                                   # 새 시도 시작: 이번에 켜진 옵션에 맞게 구역 제한을 다시 정함
-            self.zones = self.load_zones()
-            self._curv_src = None
+            self.configure_attempt()
         self.reset_control()
         self.odom = self.path = None
         self.override = None
         self.override_active = False
         self.steer_hist.clear()
+        self.path_vlim = []
+        self._curv_src = self._prof = None
+        self.last_speed_sample = None
+        self.measured_acceleration = 0.0
+        self.last_command_gear = CtrlCmd.GEAR_DRIVE
         self.reset_time = self.now()
         self.active = True
+
+    def configure_attempt(self):
+        self.config_retry = self.now()
+        try:
+            self.runtime_config = load_runtime_config(self.get_parameter('course_json').value or None)
+            options = self.runtime_config['options']
+            c = self.runtime_config.get('course', {})
+            if self.auto_latency:
+                self.steer_delay_comp = float(c.get('steer_latency_ms', 250)) / 1000.0 if option_on(options, 'steer_latency') else 0.0
+                self.speed_lead_s = (float(c.get('drive_latency_ms', 75)) / 1000.0 if option_on(options, 'drive_latency') else 0.0) + 0.04
+            self.zones = self.load_zones()
+            self._curv_src = None
+            self.config_ready = True
+            self.get_logger().info(f'제어 지연 보상: 조향 {self.steer_delay_comp:.3f}s, 속도 앞보기 {self.speed_lead_s:.3f}s; v_max={self.v_max:.1f}')
+        except (ValueError, OSError) as error:
+            self.config_ready = False
+            self.get_logger().error(f'구성 확인 대기 (정지): {error}')
 
     def load_zones(self):
         """course.json의 저마찰(low_friction)·경사(slope)·장애물 구간 다각형. 못 읽으면 빈 dict (구간 대응만 꺼짐).
@@ -159,7 +197,7 @@ class Control(Node):
         try:
             with open(path, encoding='utf-8') as f:
                 missions = json.load(f)['course']['missions']
-            options = load_options(self.get_parameter('course_json').value or None)
+            options = self.runtime_config['options']
             kinds = tuple(k for k in ('low_friction', 'slope', 'obstacle1', 'obstacle3')
                           if option_on(options, k) and (k != 'low_friction' or self.lowmu_enabled))
             if getattr(self, '_zone_kinds', None) != kinds:
@@ -169,8 +207,7 @@ class Control(Node):
             return {m['type']: [tuple(p) for p in m['zone']] for m in missions
                     if m.get('type') in kinds and m.get('zone')}
         except Exception as e:
-            self.get_logger().warn(f'저마찰·경사 구간을 못 읽어 일반 주행으로만 합니다: {e}')
-            return {}
+            raise ValueError(f'노면 구간을 읽지 못해 주행을 대기합니다: {e}') from e
 
     def in_zone(self, kind, x, y):
         poly = self.zones.get(kind)
@@ -192,6 +229,20 @@ class Control(Node):
         return self.get_clock().now().nanoseconds * 1e-9
 
     def on_odom(self, m):
+        if not self.active or not fresh(m, self.now(), self.odom_timeout_s, self.reset_time):
+            return
+        if m.twist.covariance[0] >= 1e5:
+            self.odom = None
+            return
+        t = stamp(m)
+        if self.last_speed_sample is not None:
+            previous_t, previous_v = self.last_speed_sample
+            dt = t - previous_t
+            if dt <= 0.0:
+                return
+            a = clamp((m.twist.twist.linear.x - previous_v) / dt, -4.0, 3.0)
+            self.measured_acceleration += (1.0 - math.exp(-dt / 0.25)) * (a - self.measured_acceleration)
+        self.last_speed_sample = (t, m.twist.twist.linear.x)
         self.odom = m
         p, q = m.pose.pose.position, m.pose.pose.orientation
         self.x, self.y = p.x, p.y
@@ -199,12 +250,16 @@ class Control(Node):
         self.speed = m.twist.twist.linear.x
 
     def on_path(self, m):
+        if not self.active or not fresh(m, self.now(), self.path_timeout_s, self.reset_time):
+            return
+        self.path_stamp = stamp(m)
         self.path = [(ps.pose.position.x, ps.pose.position.y,
                       2 * math.atan2(ps.pose.orientation.z, ps.pose.orientation.w)) for ps in m.poses]
         self.path_vlim = [ps.pose.position.z for ps in m.poses]      # 미션이 붙인 점별 속도 한계 (m/s, 0 = 없음)
 
     def on_override(self, m):
-        self.override = (m, self.now())
+        if self.active and fresh(m, self.now(), self.override_timeout_s, self.reset_time):
+            self.override = (m, stamp(m))
 
     def nearest(self, x, y):
         return min(self.path, key=lambda p: math.hypot(p[0] - x, p[1] - y))
@@ -213,13 +268,25 @@ class Control(Node):
     def tick(self):
         if not self.active:
             return
-        if self.odom is None or self.path is None or self.now() - self.reset_time < SETTLE_S:
-            self.send(0.0, 1.0, 0.0)                 # 시작·복귀 직후, 위치·경로가 아직 없으면 정지
+        if not self.config_ready:
+            if self.now() - self.config_retry >= 1.0:
+                self.configure_attempt()
+            self.target_reason = 'waiting_for_configuration'
+            self.send(0.0, 1.0, 0.0, self.last_command_gear)
+            return
+        if not fresh(self.odom, self.now(), self.odom_timeout_s, self.reset_time) or self.now() - self.reset_time < SETTLE_S:
+            self.target_reason = 'waiting_for_odometry'
+            self.send(0.0, 1.0, 0.0, self.last_command_gear)
             return
         if self.override is not None and self.now() - self.override[1] <= self.override_timeout_s:
             m = self.override[0]                     # 미션 직접 제어가 우선
             self.override_active = True
+            self.target_reason = 'mission_override'
             self.send(m.accel, m.brake, m.steering, m.gear)
+            return
+        if self.path is None or self.now() - self.path_stamp > self.path_timeout_s:
+            self.target_reason = 'waiting_for_path'
+            self.send(0.0, 1.0, 0.0, self.last_command_gear)
             return
         if self.override_active:                     # 직접 제어가 끝남: PI를 새로 시작
             self.override_active = False
@@ -235,11 +302,11 @@ class Control(Node):
             rate = self.steer_rate_lowmu if low else self.steer_rate_max
             step = rate * self.dt                    # 조향 변화율 제한: 한 번에 이만큼만 바뀜
             want = self.steering(low)
-            if want * self._steer_last < 0.0:        # 조향 방향이 바뀔 때는 제한 없이 바로 따라감 (S자 전환)
-                steer = want
-            else:
-                steer = clamp(want, self._steer_last - step, self._steer_last + step)
+            steer = clamp(want, self._steer_last - step, self._steer_last + step)
             target = self.speed_target()
+        self.target = target
+        if not self.path:
+            self.target_reason = 'end_of_path'
         accel, brake = self.longitudinal(target, low, slope)
         return accel, brake, steer
 
@@ -249,7 +316,7 @@ class Control(Node):
         - 구동 <-> 제동 전환에 히스테리시스(brake_on/brake_off)를 둬서 경계에서 떨지 않게 합니다.
         - 저마찰 구간에서는 구동·제동 상한을 둬서 바퀴가 미끄러지지 않게 합니다."""
         error = target - self.speed
-        brake_ff = self.brake_feedforward() if self.path and error < 0.3 else 0.0
+        brake_ff = self.brake_feedforward() if self.path and error < 0.1 else 0.0
         mult = self.slope_ki_mult if slope else 1.0
         ki = self.ki * mult
         if not ((self._u_sat > 0 and error > 0) or (self._u_sat < 0 and error < 0)):
@@ -280,6 +347,7 @@ class Control(Node):
         px, py, path_yaw = self.path[i]
         heading_error = angle_diff(path_yaw, yaw)
         cross_error = -math.sin(path_yaw) * (px - fx) + math.cos(path_yaw) * (py - fy)   # 경로가 왼쪽이면 +
+        self.cross_error, self.heading_error = cross_error, heading_error
         if low:                                      # 저마찰 구간: 저속에서도 조향을 끝까지 쓰도록 이득 보강
             wheel_angle = (self.k_heading_lowmu * heading_error
                            + math.atan2(self.k_stanley_lowmu * cross_error, self.k_soft_lowmu + abs(self.speed)))
@@ -289,26 +357,10 @@ class Control(Node):
 
     def predict_pose(self):
         """Bicycle Kinematic Model로 steer_delay_comp초 뒤의 뒤차축 위치·방향 (x, y, yaw)를 예측합니다.
-        속력은 지금 값으로 일정하다고 보고, 그 사이 차에 닿는 조향은 이미 보낸 명령(steer_hist)에서 가져옵니다
+        속력은 최근 가감속을 반영하고, 그 사이 차에 닿는 조향은 이미 보낸 명령(steer_hist)에서 가져옵니다
         (시각 t의 조향각 = t - steer_delay_comp에 보낸 명령). 보상 시간이 0이면 지금 자세 그대로입니다."""
-        T = self.steer_delay_comp
-        x, y, yaw = self.x, self.y, self.yaw
-        if T <= 0.0:
-            return x, y, yaw
-        steps = max(1, int(round(T / PREDICT_DT)))
-        dt = T / steps
-        t0 = self.now() - T                          # 예측 구간의 첫 순간에 차에 닿는 명령을 보낸 시각
-        hist = self.steer_hist
-        j, delta = 0, 0.0
-        for k in range(steps):
-            tk = t0 + k * dt
-            while j < len(hist) and hist[j][0] <= tk:
-                delta = hist[j][1]
-                j += 1
-            x += self.speed * math.cos(yaw) * dt
-            y += self.speed * math.sin(yaw) * dt
-            yaw += self.speed / WHEELBASE * math.tan(delta) * dt
-        return x, y, yaw
+        return predict_motion(self.x, self.y, self.yaw, self.speed, self.now(),
+                              self.steer_delay_comp, self.steer_hist, self.measured_acceleration)
 
     def note_steer(self, steer):
         """보낸 조향 명령을 기록합니다 (예측과 조향 변화율 제한에 씀)."""
@@ -362,42 +414,61 @@ class Control(Node):
             return 0.0
         v, s = self._prof, self._s
         i = self.nearest_index(self.x, self.y)
-        j = min(len(v) - 1, i + max(1, int(self.speed * self.brake_ff_lookahead_s / 0.5)))
+        j = i
+        while j + 1 < len(v) and s[j + 1] - s[i] <= max(0.5, abs(self.speed) * self.brake_ff_lookahead_s):
+            j += 1
         if j <= i or s[j] - s[i] < 1e-6:
             return 0.0
-        a_req = (v[i] ** 2 - v[j] ** 2) / (2.0 * (s[j] - s[i]))   # 프로파일을 그대로 따라가는 데 필요한 감속
+        a_req = (self.speed ** 2 - v[j] ** 2) / (2.0 * (s[j] - s[i]))
         return clamp(a_req / self.brake_ff_decel, 0.0, 1.0)
 
     def speed_target(self):
         """목표 속력 (m/s). 곡률 한계 속도에 코너 앞 감속(뒤에서 앞으로 전파)을 더한 프로파일에서 지금 위치의 값."""
         if not self.profile_enabled:
+            self.target_reason = 'constant_speed'
             return self.target_speed
         k = self.curvature()
         s = self._s
         n = len(k)
         low, slope = self._low_plan, self._slope
-        v = []
+        v, reasons = [], []
         for i, c in enumerate(k):                    # 점마다 한계: 저마찰이면 더 보수적, 경사면 최고 속도 제한
             if low[i]:
                 a_lat, lo, hi = self.a_lat_lowmu, self.v_min_lowmu, min(self.v_max, self.v_max_lowmu)
+                reason = 'low_friction'
             else:
-                a_lat, lo, hi = self.a_lat_max, self.v_min, min(self.v_max, self.v_max_slope) if slope[i] else self.v_max
+                a_lat = self.a_lat_slope if slope[i] else self.a_lat_max
+                lo, hi = self.v_min, min(self.v_max, self.v_max_slope) if slope[i] else self.v_max
+                reason = 'slope' if slope[i] else 'straight'
             if self._obst[i]:                        # 장애물 구간: 어디서 장애물이 나와도 대응할 수 있게 미리 속도를 낮춤
                 hi = min(hi, self.v_max_obstacle)
                 lo = min(lo, hi)                     # v_min(4.5)이 구간 최고 속도보다 크면 구간 속도가 무시되므로 같이 낮춤
-            vi = clamp(math.sqrt(a_lat / max(abs(c), 1e-6)), lo, hi)
+                reason = 'obstacle_zone'
+            curve_limit = math.sqrt(a_lat / max(abs(c), 1e-6))
+            vi = min(hi, curve_limit)                # a speed floor must never defeat a corner limit
+            if curve_limit < hi:
+                reason = reason + '_curvature'
             if len(self.path_vlim) == n and self.path_vlim[i] > 0.0:   # 미션이 붙인 속도 한계는 v_min보다도 우선
-                vi = min(vi, self.path_vlim[i])
+                if self.path_vlim[i] < vi:
+                    vi, reason = self.path_vlim[i], 'mission_path'
             v.append(vi)
+            reasons.append(reason)
         for i in range(n - 2, -1, -1):               # 앞쪽 점의 속도에서 감속으로 줄일 수 있는 속도까지만 허용
             a_dec = self.a_decel_lowmu if low[i] else self.a_decel
-            v[i] = min(v[i], math.sqrt(v[i + 1] ** 2 + 2.0 * a_dec * (s[i + 1] - s[i])))
+            limit = math.sqrt(v[i + 1] ** 2 + 2.0 * a_dec * (s[i + 1] - s[i]))
+            if limit < v[i]:
+                v[i], reasons[i] = limit, 'braking_ahead'
         self._prof = v
         i = self.nearest_index(self.x, self.y)
-        last = min(n - 1, i + 1 + int(self.speed * self.speed_lead_s / 0.5))
+        last = i
+        while last + 1 < n and s[last + 1] - s[i] <= max(0.0, self.speed * self.speed_lead_s):
+            last += 1
+        limiting = min(range(i, last + 1), key=lambda j: v[j])
+        self.target_reason = reasons[limiting]
         return min(v[i:last + 1])
 
     def send(self, accel, brake, steer, gear=CtrlCmd.GEAR_DRIVE):
+        self.last_command_gear = gear
         self.note_steer(float(steer))
         c = CtrlCmd()
         c.header.stamp = self.get_clock().now().to_msg()
@@ -406,6 +477,16 @@ class Control(Node):
         c.long_cmd_type = CtrlCmd.LONG_CMD_THROTTLE
         c.accel, c.brake, c.steering = float(accel), float(brake), float(steer)
         self.cmd_pub.publish(c)
+        if self.now() - self.last_diagnostic >= self.diagnostic_period_s:
+            self.last_diagnostic = self.now()
+            data = {'t': self.now(), 'attempt_id': getattr(self, '_sim_attempt_id', ''),
+                    'speed': self.speed if self.odom else 0.0,
+                    'target': None if self.target_reason == 'mission_override' else self.target,
+                    'reason': self.target_reason, 'cross_error': self.cross_error,
+                    'heading_error_rad': self.heading_error, 'accel': accel, 'brake': brake,
+                    'steer': steer, 'gear': gear,
+                    'odom_age_s': self.now() - stamp(self.odom) if self.odom else None}
+            self.diag_pub.publish(String(data=json.dumps(data)))
 
 
 def point_in_polygon(poly, x, y):
