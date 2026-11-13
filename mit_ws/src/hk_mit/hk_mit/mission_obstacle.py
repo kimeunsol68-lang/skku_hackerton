@@ -61,13 +61,13 @@ CULL_BEHIND = 12.0      # retain the vehicle until the longer return ramp is com
 LANE_OFFSET = 2.05      # 회피 목표 오프셋 (m), 항상 ±2.05 유지
 OBSTACLE_LENGTH = 4.3   # 장애물 실제 길이 (m). LiDAR는 앞면·옆면 일부만 보므로 smax가 실제 뒷끝보다 짧게 잡힘
 MARGIN_FRONT = 1.5      # 앞 오버행(3.845 m) 말고 더 두는 앞쪽 여유 (m): 장애물 앞끝보다 5.3 m 전에 이미 목표 차선에 도착
-PASS_MARGIN = 0.5       # 장애물 뒷면(s_max)에서 이만큼 지나면 다음 목표로 넘어가기 시작 (m)
+PASS_MARGIN = 1.3       # rear axle passes s_max by this before returning: rear overhang 0.79 + margin so the tail does not swing into the obstacle
 DROP_MARGIN = 1.2       # 뒤차축이 s_max + 이만큼 지나면 후보에서 제외 (m)
 NEXT_RANGE = 12.0       # A 뒷끝에서 B 앞끝까지가 이만큼(m) 이내면 B는 A에서 바로 이어서 회피
 RETURN_M = 10.0         # return gently enough to keep the front corners inside the road
 RAMP_MIN = 4.2          # 코사인 전환 최소 길이 (m)
 KAPPA_LIM = 0.10        # about 10 m lane-change ramps, checked against the whole body
-SPEED_LIMIT = 3.2       # maneuver only; release the cap on the clear part of the path
+SPEED_LIMIT = 4.0       # maneuver only (~1.6 m/s^2 lateral on the 0.10 1/m ramps). 3.2 cost ~3 s; 4.5 was not verified
 PATH_BEHIND, PATH_AHEAD, PATH_STEP = 2.0, 18.0, 0.5   # override_path 범위 (뒤차축 기준 m)
 SEARCH_BEHIND, SEARCH_AHEAD = 12, 100   # 전역 경로에서 찾는 범위 (점 번호, 0.5 m 간격)
 
@@ -119,7 +119,7 @@ class Track:
 
 class ObstacleMission(MissionBase):
     NAME = 'obstacle'
-    SECTIONS = (('cp1', 'cp2'), ('cp6', 'cp7'))
+    SECTIONS = (('start', 'cp1'), ('cp1', 'cp2'), ('cp6', 'cp7'))
 
     def __init__(self, logger=None):
         self.pts = None            # 전역 경로 (N, 2), 처음 쓸 때 읽음
@@ -134,7 +134,13 @@ class ObstacleMission(MissionBase):
         self.last_warning = -math.inf
 
     def on_enter(self, section):
+        # start->cp1 also runs this mission: obstacle1 can sit only ~7 m past cp1 (seed 12345), too late to
+        # start avoiding at cp1. Keep the tracks/zone across start->cp1 => cp1->cp2 so the maneuver is not cut.
+        if section == ('cp1', 'cp2') and getattr(self, 'section', None) == ('start', 'cp1'):
+            self.section = section
+            return
         self.reset()
+        self.section = section
 
     # ---- 준비 ---------------------------------------------------------------------------------------
     def _load(self):
@@ -235,7 +241,10 @@ class ObstacleMission(MissionBase):
             # Keep real vehicle surfaces near the lane, discard thin long boundaries.
             if abs(float(np.median(d[m]))) > 2.65:
                 continue
-            if np.ptp(s[m]) > 6.0 or np.ptp(d[m]) > 2.8:
+            # A 4.3 m obstacle placed ACROSS the road shows a thin straight front face up to ~3.5 m wide
+            # (seed 6). Accept such a face only when it is thin along the road; other wide clusters stay rejected.
+            face = np.ptp(s[m]) <= 1.5 and np.ptp(d[m]) <= OBSTACLE_LENGTH + 0.3
+            if np.ptp(s[m]) > 6.0 or (np.ptp(d[m]) > 2.8 and not face):
                 continue
             out.append((float(s[m].mean()), float(d[m].mean()), float(s[m].min()), float(s[m].max()),
                         float(d[m].min()), float(d[m].max()), float(xy[m, 0].mean()), float(xy[m, 1].mean())))
@@ -404,7 +413,10 @@ class ObstacleMission(MissionBase):
             overlap = (s_max > tr.smin-margin) & (s_min < tr.back()+margin)
             if np.any(overlap & (d_max > tr.dmin-margin) & (d_min < tr.dmax+margin)):
                 safe = False
-                safety_reason = f'장애물 여유 s={tr.s:.1f}, d={tr.d:.2f}'
+                bad = overlap & (d_max > tr.dmin-margin) & (d_min < tr.dmax+margin)
+                safety_reason = (f'장애물 여유 s={tr.s:.1f}, d={tr.d:.2f} tr s[{tr.smin:.1f},{tr.back():.1f}] '
+                                 f'd[{tr.dmin:.2f},{tr.dmax:.2f}] off={tr.offset:.2f} m={margin:.2f} '
+                                 f'car d[{d_min[bad].min():.2f},{d_max[bad].max():.2f}] at s {s_grid[bad].min():.1f}-{s_grid[bad].max():.1f} ego {s_ego:.1f}')
         if not safe:
             if self.log and inp.t - self.last_warning > 1.0:
                 self.log.warn('회피 경로 차체 여유 부족: ' + safety_reason)

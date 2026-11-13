@@ -14,7 +14,7 @@ from .mission_rotary import RotaryMission
 from .course import load_options, option_on
 
 MISSIONS = (ParkingMission, ObstacleMission, RotaryMission)
-SECTION_OPTIONS = {('cp1', 'cp2'): 'obstacle1', ('cp6', 'cp7'): 'obstacle3',
+SECTION_OPTIONS = {('start', 'cp1'): 'obstacle1', ('cp1', 'cp2'): 'obstacle1', ('cp6', 'cp7'): 'obstacle3',
                    ('cp8', 'cp9'): 'parallel_parking', ('cp9', 'cp10'): 'rear_parking',
                    ('cp5', 'cp6'): 'roundabout'}
 ERROR_LOG_PERIOD_S = 1.0

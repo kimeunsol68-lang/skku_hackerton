@@ -97,11 +97,15 @@ PARAMS = {
     'obstacle_lead_m': 12.0,  # 장애물 구역 입구 이만큼(m) 앞에서부터 이미 v_max_obstacle로 달리게 함
     'lowmu_enabled': 1.0,  # 1: 저마찰 구역 대응 켬, 0: 끔 (시뮬레이터 저마찰 옵션을 끄고 달릴 때 0으로 두면 원래 속도로 달림)
     'lowmu_lead_m': 12.0,  # 저마찰 구역 경계가 어긋나도 안전하도록, 구역 앞 이만큼(m)부터 저마찰 속도 한계를 적용
+    'lowmu_brake_lead_m': 4.0,  # 구역 앞 이만큼(m)부터는 저마찰 감속(a_decel_lowmu)으로 계획. 그보다 앞(마른 노면)에서는 a_decel로 제동
     'k_stanley_lowmu': 2.0,   # 저마찰 구간 Stanley 옆오차 이득 (저속에서 조향을 끝까지 쓰도록)
     'k_soft_lowmu': 0.3,   # 저마찰 구간 Stanley 저속 완화값 (m/s). 작을수록 저속에서 더 적극적
     'k_heading_lowmu': 1.0,   # 저마찰 구간 방향 오차(전방 주시) 가중치
     'track_point_m': 2.6,  # Stanley가 경로에 맞추는 점: 뒤차축에서 앞으로 이만큼 (3.0 = 앞바퀴 축). 줄이면 뒤쪽이 코너 안쪽으로 덜 파고듦
     'a_lat_slope': 2.8,
+    'corner_hold_m': 8.0,           # 급커브 앞 이 거리(m) 안에서는 그 커브 속도 + margin까지만 허용 (0이면 끔)
+    'corner_hold_margin': 0.6,      # 위 허용 여유 (m/s)
+    'corner_hold_vmax': 6.0,        # 이 속도보다 느린 커브만 급커브로 봄 (m/s)
     'odom_timeout_s': 0.30,
     'path_timeout_s': 0.35,
     'diagnostic_period_s': 1.0,
@@ -400,12 +404,13 @@ class Control(Node):
             if obst[i]:
                 nxt = s[i]
             self._obst[i] = nxt is not None and nxt - s[i] <= self.obstacle_lead_m
-        plan, nxt = [False] * n, None               # 계획용: 저마찰 구역 앞 lowmu_lead_m 구간도 저마찰로 봄
+        plan, brake, nxt = [False] * n, [False] * n, None   # 계획용: 저마찰 구역 앞 lowmu_lead_m 구간도 저마찰로 봄
         for i in range(n - 1, -1, -1):
             if self._low[i]:
                 nxt = s[i]
             plan[i] = nxt is not None and nxt - s[i] <= self.lowmu_lead_m
-        self._low_plan = plan
+            brake[i] = nxt is not None and nxt - s[i] <= self.lowmu_brake_lead_m   # 감속 계획만 저마찰 값으로 (속도 상한은 plan)
+        self._low_plan, self._low_brake = plan, brake
         return k
 
     def brake_feedforward(self):
@@ -453,8 +458,20 @@ class Control(Node):
                     vi, reason = self.path_vlim[i], 'mission_path'
             v.append(vi)
             reasons.append(reason)
+        if self.corner_hold_m > 0.0:                 # 급커브 직전에는 가속하지 않음: 짧은 직선에서 올린 속도를 급조향 중 제동으로 못 줄여 이탈함
+            hold = list(v)
+            j = 0
+            for i in range(n):
+                j = max(j, i)
+                while j + 1 < n and s[j + 1] - s[i] <= self.corner_hold_m:
+                    j += 1
+                m = min(v[i:j + 1])
+                if m < self.corner_hold_vmax and m + self.corner_hold_margin < hold[i]:
+                    hold[i] = m + self.corner_hold_margin
+                    reasons[i] = 'corner_hold'
+            v = hold
         for i in range(n - 2, -1, -1):               # 앞쪽 점의 속도에서 감속으로 줄일 수 있는 속도까지만 허용
-            a_dec = self.a_decel_lowmu if low[i] else self.a_decel
+            a_dec = self.a_decel_lowmu if self._low_brake[i] else self.a_decel   # 구역 앞 마른 노면에서는 평소 감속으로 늦게 제동
             limit = math.sqrt(v[i + 1] ** 2 + 2.0 * a_dec * (s[i + 1] - s[i]))
             if limit < v[i]:
                 v[i], reasons[i] = limit, 'braking_ahead'

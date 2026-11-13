@@ -17,9 +17,9 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import TransformStamped, TwistStamped
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu, NavSatFix
+from sensor_msgs.msg import Imu, LaserScan, NavSatFix
 from tf2_ros import TransformBroadcaster
-from .course import declare_file_params, load_course, load_runtime_config, option_on
+from .course import COURSE_DIR, declare_file_params, load_course, load_route, load_runtime_config, option_on
 from .sim_events import SimEvents
 from .utm import ll_to_map
 
@@ -46,6 +46,11 @@ DEFAULTS = {
     'heading_sigma': 0.04,        # 궤적 방향 측정의 최소 표준편차 (rad)
     'heading_max_step': 0.003,    # 방향 보정 한 번의 상한 (rad)
     'heading_max_turn': 0.35,     # 방향 맞춤은 완만한 구간에서만 사용 (rad)
+    # --- LiDAR 통로 벽 보정: 양쪽 벽 중앙 = 전역 경로(통로 중심선)로 옆 방향 위치를 맞춤 ---
+    'wall_sigma': 0.10,           # 벽으로 잰 옆 방향 위치 측정 표준편차 (m). 기록 재생에서 오차 p90 0.05 m
+    'wall_gate': 1.2,             # 이보다 큰 옆 방향 어긋남은 오검출로 보고 버림 (m)
+    'wall_width_tol': 0.30,       # 잰 통로 폭이 설정 통로 폭과 이만큼 이내일 때만 사용 (m)
+    'wall_max_step': 0.20,        # 한 번 보정의 최대 위치 이동 (m)
 }
 
 
@@ -228,6 +233,30 @@ class PoseFilter:
         self._normalize()
         self.counts['gps_update'] += 1
 
+    def wall(self, timestamp, nx, ny, offset):
+        """통로 양쪽 벽으로 잰 옆 방향 위치 오차 offset = n·(추정 위치 - 실제 위치) (n = 경로 법선). GNSS 편향과 무관.
+        LiDAR는 지연되어 도착하므로 필터 시각을 되돌리지 않고 현재 상태에 적용한다(오차는 천천히 변함)."""
+        if timestamp > self.time:                # 더 새 측정이면 그 시각까지 예측, 오래된 측정이면 현재 상태 그대로
+            self.advance(timestamp)
+        measurement = np.array([[nx, ny, 0., 0., 0., 0.]])
+        innovation = np.array([-offset])
+        if abs(innovation[0]) > self.cfg['wall_gate']:
+            self.counts['wall_rejected'] += 1
+            return
+        measurement_cov = np.array([[self.cfg['wall_sigma']**2]])
+        innovation_cov = measurement @ self.cov @ measurement.T + measurement_cov
+        gain = np.linalg.solve(innovation_cov, measurement @ self.cov).T
+        gain[2:4, :] = 0.0                       # 옆 방향 위치만 고침 (방향·자이로 편향은 건드리지 않음)
+        delta = gain @ innovation
+        scale = min(1.0, self.cfg['wall_max_step'] / max(np.linalg.norm(delta[:2]), 1e-12))
+        gain *= scale
+        self.state += gain @ innovation
+        residual = np.eye(6) - gain @ measurement
+        self.cov = residual @ self.cov @ residual.T + gain @ measurement_cov @ gain.T
+        self._normalize()
+        self.diagnostics['wall_innovation_m'] = float(innovation[0])
+        self.counts['wall_update'] += 1
+
     def _trajectory_heading(self, timestamp, x, y):
         """한 점의 GPS 방향 대신 여러 점의 궤적과 독립적인 추측항법 궤적을 비교한다."""
         self.gps_history.append((timestamp, x, y, *self.dead_pose))
@@ -309,7 +338,11 @@ class Localization(Node):
         self.declare_parameter('auto_sensor_noise', True)
         self.runtime_ready = False
         self.config_retry = -math.inf
+        self.corridor_width = 4.392
+        self.pose_history = deque(maxlen=60)          # (t, x, y, yaw) of published poses, for LiDAR scan time
+        self._load_wall_geometry()
         self.reset(None)
+        self.create_subscription(LaserScan, '/hk/sensors/lidar/scan', self.on_scan, qos_profile_sensor_data)
         self.create_subscription(NavSatFix, '/hk/sensors/gps/fix', self.on_gps, qos_profile_sensor_data)
         self.create_subscription(Imu, '/hk/sensors/imu/data', self.on_imu, qos_profile_sensor_data)
         self.create_subscription(TwistStamped, '/hk/sensors/wheel_encoder/speed', self.on_wheel, qos_profile_sensor_data)
@@ -340,7 +373,15 @@ class Localization(Node):
                     self.cfg['gps_bias_sigma'] = max(self.cfg['gps_bias_sigma'], float(sensors.get('gnss_multipath_sigma', 0.3)))
                 if not option_on(options, 'imu_noise'):
                     self.cfg.update(gyro_noise=0.0002, bias_walk=0.00002)
+            self.corridor_width = float(runtime.get('corridor_width_m', self.corridor_width))
+            self.zone_widths = []
+            for mission in runtime.get('course', {}).get('missions', []):
+                zone = mission.get('zone') if str(mission.get('type', '')).startswith('obstacle') else None
+                if zone:
+                    xs, ys = [q[0] for q in zone], [q[1] for q in zone]
+                    self.zone_widths.append(round(min(max(xs) - min(xs), max(ys) - min(ys)), 2))
             self.runtime_ready = True
+            self.get_logger().info(f'위치 추정 벽 보정: 통로 폭 {self.corridor_width:.2f} m')
             self.get_logger().info(f'위치 추정 잡음 설정: gps_sigma={self.cfg["gps_sigma"]:.3f}, gps_bias_sigma={self.cfg["gps_bias_sigma"]:.3f}')
         except ValueError as error:
             self.runtime_ready = False
@@ -366,6 +407,7 @@ class Localization(Node):
         self.last_clock = self.reset_time
         self.filter = PoseFilter(pose or (0.0, 0.0, 0.0), self.reset_time, self.cfg)
         self.queue, self.last_stamp = [], {}
+        self.pose_history.clear()
         self.sequence = 0
         self.received = Counter()
         self.x, self.y, self.yaw = pose or (0.0, 0.0, 0.0)
@@ -387,6 +429,90 @@ class Localization(Node):
         self.sequence += 1
         heapq.heappush(self.queue, (timestamp, self.sequence, kind, values))
         self.received[kind] += 1
+
+    def _load_wall_geometry(self):
+        pts = np.asarray(load_route(self).points, dtype=float)
+        seg = np.diff(pts, axis=0)
+        self.route_pts = pts
+        self.route_s = np.concatenate([[0.0], np.cumsum(np.hypot(seg[:, 0], seg[:, 1]))])
+        tan = np.vstack([seg, seg[-1:]])
+        tan[1:-1] = seg[1:] + seg[:-1]
+        tan /= np.maximum(np.hypot(tan[:, 0], tan[:, 1]), 1e-9)[:, None]
+        self.route_tan = tan
+        self.route_nor = np.stack([-tan[:, 1], tan[:, 0]], axis=1)
+        self.lidar_x = 1.15
+        try:
+            import yaml
+            with open(COURSE_DIR.parent / 'config' / 'sensor_mounts.yaml', encoding='utf-8') as f:
+                self.lidar_x = float(yaml.safe_load(f)['lidar']['x'])
+        except Exception:
+            pass
+
+    def wall_widths(self):
+        return [self.corridor_width] + sorted(set(getattr(self, 'zone_widths', [])))
+
+    def _pose_at(self, t):
+        h = self.pose_history
+        if not h or t < h[0][0] - 0.05 or t > h[-1][0] + 0.15:
+            return None
+        previous = h[0]
+        for row in h:
+            if row[0] >= t:
+                span = row[0] - previous[0]
+                k = 0.0 if span <= 1e-9 else (t - previous[0]) / span
+                dh = math.atan2(math.sin(row[3] - previous[3]), math.cos(row[3] - previous[3]))
+                return (previous[1] + k * (row[1] - previous[1]), previous[2] + k * (row[2] - previous[2]), previous[3] + k * dh)
+            previous = row
+        return h[-1][1:]
+
+    def on_scan(self, message):
+        """양쪽 통로 벽의 중앙 = 경로 중심선. 벽 중앙이 경로에서 e만큼 벗어나 보이면 내 위치가 e만큼 틀린 것."""
+        if not self.ready or not self.runtime_ready:
+            return
+        t = stamp(message)
+        pose = self._pose_at(t)
+        if pose is None:
+            return
+        x, y, yaw = pose
+        pts = self.route_pts
+        win = slice(0, len(pts))
+        ei = int(np.argmin(np.hypot(pts[win, 0] - x, pts[win, 1] - y)))
+        r = np.asarray(message.ranges, dtype=float)
+        ang = message.angle_min + np.arange(len(r)) * message.angle_increment
+        ok = np.isfinite(r) & (r > max(message.range_min, 0.3)) & (r < 12.0)
+        if ok.sum() < 20:
+            return
+        ox, oy = x + self.lidar_x * math.cos(yaw), y + self.lidar_x * math.sin(yaw)
+        a = ang[ok] + yaw
+        xy = np.stack([ox + r[ok] * np.cos(a), oy + r[ok] * np.sin(a)], axis=1)
+        i0, i1 = max(0, ei - 20), min(len(pts), ei + 40)
+        cand = pts[i0:i1]
+        gi = ((xy[:, None, :] - cand[None, :, :]) ** 2).sum(-1).argmin(1) + i0
+        rel = xy - pts[gi]
+        s = self.route_s[gi] + (rel * self.route_tan[gi]).sum(1)
+        d = (rel * self.route_nor[gi]).sum(1)
+        s0 = self.route_s[ei]
+        near = (s > s0 - 2.0) & (s < s0 + 8.0)
+        med = None
+        for width_expected in self.wall_widths():       # 좁은 통로 폭, 그다음 장애물 구간 폭(7.5 m)
+            half = width_expected / 2.0
+            found = []
+            for side in (1, -1):
+                m = near & (side * d > half - 0.9) & (side * d < half + 0.9)
+                if m.sum() < 8 or np.ptp(s[m]) < 3.0:
+                    break
+                md = float(np.median(d[m]))
+                if np.std(d[m] - md) > 0.15:
+                    break
+                found.append(md)
+            if len(found) == 2 and abs(found[0] - found[1] - width_expected) <= self.cfg['wall_width_tol']:
+                med = found
+                break
+        if med is None:
+            return
+        offset = 0.5 * (med[0] + med[1])             # = n·(내 위치 - 실제 위치)
+        nx, ny = map(float, self.route_nor[ei])
+        self.enqueue('wall', message, (nx, ny, offset))
 
     def on_wheel(self, message):
         self.enqueue('wheel', message, (message.twist.linear.x,))
@@ -428,6 +554,7 @@ class Localization(Node):
         self.filter.advance(cutoff)
         state, covariance = self.filter.estimate(now)
         self.x, self.y, self.yaw = map(float, state[:3])
+        self.pose_history.append((now, self.x, self.y, self.yaw))
         self.speed, measured_rate = self.filter.motion(now)
         angular_rate = measured_rate - state[3] if measured_rate is not None and abs(self.speed) >= 0.04 else 0.0
         message = Odometry()
