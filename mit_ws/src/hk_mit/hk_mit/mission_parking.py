@@ -604,6 +604,7 @@ def build_path(start, prims, ds=0.1):
     return out
 
 
+REAR_HOLD_S = 3.05            # 후면주차 정지 유지 (규정 3.0 s, 실제 정지 시점부터 셈)
 REAR_STOP_CHECK_S = 0.12     # 후면주차 정지 확인 (T자 진입 끝 정지 -> 후진 전환 대기 최소화)
 GATE_SCANS = 10             # 후면주차 통로 추정에 쓰는 최근 스캔 수 (10 Hz -> 1 s)
 
@@ -953,7 +954,7 @@ class RearParking(Parking):
         if st == 'HOLD':
             if self.t_hold0 is None:
                 self.t_hold0 = self.stopped_since if self.stopped_since is not None else now
-            if now - self.t_hold0 >= p['park_hold_s']:
+            if now - self.t_hold0 >= REAR_HOLD_S:
                 self.path = self._exit_path(x, y)
                 self._set('EXIT_SHIFT_D', now)
             return 0.0, 1.0, 0.0, R

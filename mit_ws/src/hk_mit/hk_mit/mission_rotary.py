@@ -287,9 +287,10 @@ class RotaryMission(MissionBase):
             self.enabled = option_on(opts, 'roundabout')
             from .course import fast_mode
             # 공격 모드(2차 시도): 합류 여유를 줄이고 출구·접근·원 안 속도를 올림
+            self.exit_cap_m = 20.0 if fast_mode(opts) else EXIT_CAP_M
             self.rolling = False                # 무정지 합류: NPC 충돌 3회(seed 0) -> 끔
             self.t_clear, self.exit_speed, self.approach_vmax, self.go_speed = \
-                (3.4, 6.5, 8.0, 6.3) if fast_mode(opts) else (T_CLEAR, EXIT_SPEED, APPROACH_VMAX, GO_SPEED)
+                (3.4, 8.0, 8.0, 6.3) if fast_mode(opts) else (T_CLEAR, EXIT_SPEED, APPROACH_VMAX, GO_SPEED)
             if self.log and not self.enabled:
                 self.log.info('로터리 옵션이 꺼져 있어 로터리 미션을 건너뜁니다')
         if not self.enabled:
@@ -306,7 +307,7 @@ class RotaryMission(MissionBase):
         rel = np.array([inp.x, inp.y]) - self.pts[ego_i]
         s_ego = float(self.s[ego_i] + rel @ self.tan[ego_i])
         s_front = s_ego + FRONT_OVERHANG
-        if s_ego > g['s_exit'] + EXIT_CAP_M:                            # 원과 출구 커브를 모두 빠져나감
+        if s_ego > g['s_exit'] + getattr(self, 'exit_cap_m', EXIT_CAP_M):                            # 원과 출구 커브를 모두 빠져나감
             return MissionOutput(is_done=True)
         if not inp.local_path:
             return MissionOutput()
