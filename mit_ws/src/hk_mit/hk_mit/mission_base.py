@@ -16,6 +16,7 @@ planner.py 안의 MissionManager가 20 Hz로 "지금 CP 구간이 SECTIONS에 �
 출력 MissionOutput
     override_path      None = 기본 경로 그대로 / [(x, y), ...] 또는 [(x, y, yaw), ...] = 이 경로를 대신 냄
                        (control.py의 Stanley + PI가 이 경로를 따라감. 점 2개 이상, 0.5 m 간격 권장)
+                       점을 (x, y, yaw, v_limit)로 내면 그 점의 속도 한계(m/s, 0 = 제한 없음)도 control에 전달됩니다.
     override_cmd       None = 평소 제어 / (throttle, brake, steer, gear) = control.py가 이 명령을 그대로 보냄
                          throttle 0~1, brake 0~1, steer -1~1 (+ 왼쪽, 1 = 35.4°), gear 'D' | 'R' | 'N' | 'P'
     is_done            True면 이 구간에서 미션 완료 → 이 구간이 끝날 때까지 다시 부르지 않음

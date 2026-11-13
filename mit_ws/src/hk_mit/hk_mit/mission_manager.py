@@ -85,11 +85,11 @@ class MissionManager:
             return None
         try:
             pts = [tuple(float(v) for v in p) for p in path]
-            if len(pts) >= 2 and all(len(p) in (2, 3) and all(math.isfinite(v) for v in p) for p in pts):
+            if len(pts) >= 2 and all(len(p) in (2, 3, 4) and all(math.isfinite(v) for v in p) for p in pts):
                 return pts
         except (TypeError, ValueError):
             pass
-        self._error(m, t, 'override_path 형식 오류: [(x, y), ...] 또는 [(x, y, yaw), ...], 점 2개 이상')
+        self._error(m, t, 'override_path 형식 오류: [(x, y), ...] / [(x, y, yaw), ...] / [(x, y, yaw, v_limit), ...], 점 2개 이상')
         return None
 
     def _check_cmd(self, m, cmd, t):

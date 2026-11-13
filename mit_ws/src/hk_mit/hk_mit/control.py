@@ -91,6 +91,8 @@ PARAMS = {
     'steer_rate_max': 8.0,    # 조향 변화율 한계 (1/s). 사실상 제한 없음. 방향이 바뀔 때는 항상 즉시 추종
     'brake_on': 0.10,      # 구동 -> 제동으로 바꾸는 문턱 (u가 -brake_on보다 작을 때)
     'brake_off': 0.03,     # 제동 -> 구동으로 되돌리는 문턱 (u가 -brake_off보다 클 때). 떨림 방지
+    'v_max_obstacle': 3.5,   # 장애물 구간(obstacle1/obstacle3 zone) 안 최고 속도 (m/s). 미션이 장애물을 찾기 전에도 미리 낮춰 둠
+    'obstacle_lead_m': 12.0,  # 장애물 구역 입구 이만큼(m) 앞에서부터 이미 v_max_obstacle로 달리게 함
     'lowmu_enabled': 1.0,  # 1: 저마찰 구역 대응 켬, 0: 끔 (시뮬레이터 저마찰 옵션을 끄고 달릴 때 0으로 두면 원래 속도로 달림)
     'lowmu_lead_m': 12.0,  # 저마찰 구역 경계가 어긋나도 안전하도록, 구역 앞 이만큼(m)부터 저마찰 속도 한계를 적용
     'k_stanley_lowmu': 2.0,   # 저마찰 구간 Stanley 옆오차 이득 (저속에서 조향을 끝까지 쓰도록)
@@ -119,8 +121,9 @@ class Control(Node):
         self.reset_time = None
         self.override = None                         # (CtrlCmd, 받은 시각)
         self.override_active = False
+        self.path_vlim = []
         self._curv_src = self._curv = self._s = self._prof = None
-        self._low = self._slope = self._low_plan = []
+        self._low = self._slope = self._low_plan = self._obst = []
         self._steer_last = 0.0                       # 마지막으로 보낸 조향 (조향 변화율 제한용)
         self._braking = False                        # 구동/제동 전환 히스테리시스 상태
         self._u_sat = 0.0
@@ -151,7 +154,7 @@ class Control(Node):
         try:
             with open(path, encoding='utf-8') as f:
                 missions = json.load(f)['course']['missions']
-            kinds = ('low_friction', 'slope') if self.lowmu_enabled else ('slope',)
+            kinds = ('low_friction' if self.lowmu_enabled else None, 'slope', 'obstacle1', 'obstacle3')
             return {m['type']: [tuple(p) for p in m['zone']] for m in missions
                     if m.get('type') in kinds and m.get('zone')}
         except Exception as e:
@@ -187,6 +190,7 @@ class Control(Node):
     def on_path(self, m):
         self.path = [(ps.pose.position.x, ps.pose.position.y,
                       2 * math.atan2(ps.pose.orientation.z, ps.pose.orientation.w)) for ps in m.poses]
+        self.path_vlim = [ps.pose.position.z for ps in m.poses]      # 미션이 붙인 점별 속도 한계 (m/s, 0 = 없음)
 
     def on_override(self, m):
         self.override = (m, self.now())
@@ -327,6 +331,12 @@ class Control(Node):
         self._curv_src, self._curv, self._s = path, k, s
         self._low = [self.in_zone('low_friction', p[0], p[1]) for p in path]
         self._slope = [self.in_zone('slope', p[0], p[1]) for p in path]
+        obst = [self.in_zone('obstacle1', p[0], p[1]) or self.in_zone('obstacle3', p[0], p[1]) for p in path]
+        self._obst, nxt = [False] * n, None         # 장애물 구역 입구 obstacle_lead_m 앞부터 구역 끝까지
+        for i in range(n - 1, -1, -1):
+            if obst[i]:
+                nxt = s[i]
+            self._obst[i] = nxt is not None and nxt - s[i] <= self.obstacle_lead_m
         plan, nxt = [False] * n, None               # 계획용: 저마찰 구역 앞 lowmu_lead_m 구간도 저마찰로 봄
         for i in range(n - 1, -1, -1):
             if self._low[i]:
@@ -361,7 +371,13 @@ class Control(Node):
                 a_lat, lo, hi = self.a_lat_lowmu, self.v_min_lowmu, min(self.v_max, self.v_max_lowmu)
             else:
                 a_lat, lo, hi = self.a_lat_max, self.v_min, min(self.v_max, self.v_max_slope) if slope[i] else self.v_max
-            v.append(clamp(math.sqrt(a_lat / max(abs(c), 1e-6)), lo, hi))
+            if self._obst[i]:                        # 장애물 구간: 어디서 장애물이 나와도 대응할 수 있게 미리 속도를 낮춤
+                hi = min(hi, self.v_max_obstacle)
+                lo = min(lo, hi)                     # v_min(4.5)이 구간 최고 속도보다 크면 구간 속도가 무시되므로 같이 낮춤
+            vi = clamp(math.sqrt(a_lat / max(abs(c), 1e-6)), lo, hi)
+            if len(self.path_vlim) == n and self.path_vlim[i] > 0.0:   # 미션이 붙인 속도 한계는 v_min보다도 우선
+                vi = min(vi, self.path_vlim[i])
+            v.append(vi)
         for i in range(n - 2, -1, -1):               # 앞쪽 점의 속도에서 감속으로 줄일 수 있는 속도까지만 허용
             a_dec = self.a_decel_lowmu if low[i] else self.a_decel
             v[i] = min(v[i], math.sqrt(v[i + 1] ** 2 + 2.0 * a_dec * (s[i + 1] - s[i])))

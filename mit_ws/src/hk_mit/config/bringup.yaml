@@ -8,6 +8,8 @@ hk_mit_planner:
     behind_m: 2.0                 # 차 뒤로 남길 경로 길이 (m)
     route_csv: ""                 # 전역 경로 (0.5 m 간격)
     missions_enabled: true        # false: 미션 모듈(주차·장애물·로터리)을 부르지 않고 기본 경로만 따라감
+    obstacle3_speed: 2.3          # obstacle3 구역(장애물 3개) 속도 상한 (m/s). 0이면 끔. obstacle1 구역은 control의 v_max_obstacle
+    obstacle3_lead_m: 12.0        # obstacle3 구역 입구 이만큼(m) 앞부터 위 속도로 달림
 hk_mit_control:
   ros__parameters:
     # --- 속도 프로파일 (곡률 기반). 주의: launch의 target_speed 인자는 프로파일을 쓰는 동안 무시됩니다 ---
@@ -22,6 +24,8 @@ hk_mit_control:
     speed_lead_s: 0.25            # 구동·제동 지연 보상: 이 시간만큼 앞의 목표 속도를 씀 (s). 지연 옵션을 끄면 0.0~0.1
     target_speed: 5.0             # 프로파일을 끌 때(profile_enabled: 0)만 쓰는 목표 속력 (m/s)
     # --- 저마찰 구간 (course.json의 low_friction zone 안에서만 적용) ---
+    v_max_obstacle: 3.5           # 장애물 구간(obstacle1/obstacle3 zone) 안 최고 속도 (m/s). 12로 두면 제한 없음
+    obstacle_lead_m: 12.0         # 장애물 구역 입구 이만큼(m) 앞에서부터 v_max_obstacle로 달림
     lowmu_enabled: 1.0            # 1: 저마찰 구역 대응 켬, 0: 끔. 시뮬레이터 저마찰 옵션을 끄고 달릴 때는 0.0
     a_lat_lowmu: 0.95             # 횡가속도 한계 (m/s²). μ=0.2 한계(약 1.96)의 절반 이하. R=7 m 코너 -> 약 2.6 m/s
     v_min_lowmu: 2.3              # 이 구간의 최저 속도 (m/s)
