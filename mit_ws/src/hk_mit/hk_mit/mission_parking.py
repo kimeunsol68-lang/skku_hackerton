@@ -52,12 +52,14 @@ PARAMS = {                               # config/bringup.yaml (hk_mit_control)�
     'park_start_y': 140.0,               # 이 y보다 내려오면 주차 모드 시작
     'park_end_y': 100.0,                 # (주차 전) 이 y보다 내려가면 주차 모드가 아님
     'park_v_approach': 6.0,              # 접근 속력 (m/s)
-    'park_v_reverse': 1.2,               # 후진 속력 (m/s)
-    'park_v_reverse_fast': 1.5,          # straight portions only
+    'park_v_reverse': 1.8,               # 후진 속력 (m/s) (잔걸음 대신 한번에 또렷하게: 1.2 -> 1.8)
+    'park_v_reverse_fast': 2.0,          # straight portions only
     'park_delay': 0.25,                  # planner replaces this with actual option delay
-    'park_v_exit': 2.0,                  # 평행 주차 탈출 전진 속력 (m/s)
-    'park_v_adjust': 0.5,                # 보정·탈출 속력 (m/s)
-    'park_decel': 1.0,                   # 접근 감속 계획 (m/s^2)
+    'park_v_exit': 2.5,                  # 평행 주차 탈출 전진 속력 (m/s)
+    'park_v_adjust': 1.4,                # 보정·탈출 속력 (m/s) (잔걸음(0.3~0.5) 대신 한번에: 1.4)
+    'park_phase_timeout_s': 9.0,         # 후진/전진 등 한 phase 최대 시간 (s). 넘으면 다음 단계로 강제 전환 (정상 후진 ~7 s는 끊지 않게)
+    'park_total_timeout_s': 22.0,        # 전체 주차 시도 최대 시간 (s). 넘으면 멈춘 자리에서 완료 처리 (영구 멈춤 방지)
+    'park_decel': 1.5,                   # 접근 감속 계획 (m/s^2)
     'park_a_shift': 0.8,                 # 목표를 슬롯 중심보다 뒤로 당기는 양 (m). 앞 벽 모서리와의 간격 확보
     'park_radius': 4.5,                  # 후진 호 반지름 (m). 최소 4.22 (조향 최대)
     'park_stop_margin': 0.3,             # 정지 목표 앞당김 (m)
@@ -108,6 +110,7 @@ class Parking:
         self.scan_n = 0
         self.hist = []
         self.predicted_slot = None
+        self.t_enter = None                  # 이번 주차 시도 시작 시각 (전체 시간 초과 감시용)
 
     @property
     def done(self):
@@ -372,9 +375,18 @@ class Parking:
         self._trace(now, a, b, psi, speed, out)
         return out
 
+    _DONE_STATES = ('HOLD', 'EXIT_SHIFT_R', 'EXIT_BACK', 'EXIT_STOP', 'EXIT_SHIFT_D', 'EXIT_FWD', 'DONE')
+
     def _step(self, x, y, yaw, speed, v, a, b, psi, path, now, dt):
         p = self.p
         st = self.state
+        if self.t_enter is None:
+            self.t_enter = now
+        if st not in self._DONE_STATES and v < 0.1 and now - self.t_enter > p['park_total_timeout_s']:
+            # 전체 시간 초과: 보정을 더 시도하지 않고 멈춘 자리에서 완료 처리 (영구 멈춤 방지)
+            self.log(f'parking: 전체 시간 초과({p["park_total_timeout_s"]:.0f}s) - 지금 자리에서 완료 처리')
+            self._set('HOLD', now)
+            return 0.0, 1.0, 0.0, GEAR_REVERSE if self.dir < 0 else GEAR_DRIVE
         if st == 'IDLE':
             self._set('APPROACH', now)
             st = 'APPROACH'
@@ -411,7 +423,7 @@ class Parking:
         if st == 'REVERSE':
             steer, _ = self._pursuit(self.path, *(self.predicted_slot or (a, b, psi)), True)
             idx = min(range(self.main_n), key=lambda k:(self.path[k][0]-a)**2+(self.path[k][1]-b)**2)
-            if idx >= self.main_n - 3 or a <= self.a_target() - 0.3:
+            if idx >= self.main_n - 3 or a <= self.a_target() - 0.3 or now - self.t_state > p['park_phase_timeout_s']:
                 self._set('STOP_REV', now)
                 return 0.0, 1.0, 0.0, GEAR_REVERSE
             v_t = p['park_v_reverse']
@@ -436,7 +448,7 @@ class Parking:
             err = a - at
             moving_back = self.dir < 0
             reached = (err <= 0.05) if moving_back else (err >= -0.05)
-            if reached or now - self.t_state > 12.0:
+            if reached or now - self.t_state > p['park_phase_timeout_s']:
                 self._set('STOP_ADJ', now)
                 return 0.0, 1.0, 0.0, GEAR_REVERSE if moving_back else GEAR_DRIVE
             # 직선 b=0 위에서 방향 0을 맞추며 이동
@@ -490,15 +502,23 @@ class Parking:
         self.path = self._plan_entry_exact(a, max(b, 0.0))
         self.log(f'parking: 후진 계획 a={a:.2f} b={b:.2f} c={self._c():.2f} 점 {len(self.path)}')
 
+    def _relaxed_ok(self, a, b, psi):
+        """완화된 완료 기준: 중심 기준 세로 0.50 m, 가로 0.35 m, 방향 8도 이내 + (정지는 호출 전 이미 확인됨)."""
+        return (abs(a - self.a_target()) <= 0.50 and abs(b) <= 0.35
+                and abs(wrap(psi)) <= math.radians(8.0))
+
     def _after_stop(self, a, b, psi, now):
         p = self.p
-        ok = self.inside(a, b, psi, 0.05 + p['park_tol_margin'])
+        ok = self.inside(a, b, psi, 0.05 + p['park_tol_margin']) or self._relaxed_ok(a, b, psi)
         self.log(f'parking: 정지 a={a:.2f} b={b:.2f} psi={math.degrees(psi):.1f}도 안={ok} 보정 {self.adjust_n}')
         if ok:
             self._set('HOLD', now)
             return
         if self.adjust_n >= 4:
-            raise RuntimeError('평행 주차 보정 한도 초과: 슬롯 밖에서 완료 처리하지 않습니다')
+            # 보정 한도 초과: 더 시도하지 않고 멈춘 자리에서 완료 처리 (예전엔 여기서 RuntimeError로 영구 멈춤)
+            self.log('parking: 평행 주차 보정 한도 초과 - 지금 자리에서 완료 처리')
+            self._set('HOLD', now)
+            return
         self.adjust_n += 1
         err = a - self.a_target()
         self.dir = -1 if err > 0 else 1
@@ -797,10 +817,19 @@ class RearParking(Parking):
         self._trace(now, y, x, wrap(yaw), speed, out)
         return out
 
+    _DONE_STATES_REAR = ('HOLD', 'EXIT_SHIFT_D', 'EXIT_FWD', 'DONE')
+
     def _rstep(self, x, y, yaw, speed, v, path, now, dt):
         p = self.p
         st = self.state
         D, R = GEAR_DRIVE, GEAR_REVERSE
+        if self.t_enter is None:
+            self.t_enter = now
+        if st not in self._DONE_STATES_REAR and v < 0.1 and now - self.t_enter > p['park_total_timeout_s']:
+            # 전체 시간 초과: 보정을 더 시도하지 않고 멈춘 자리에서 완료 처리 (영구 멈춤 방지)
+            self.log(f'rear: 전체 시간 초과({p["park_total_timeout_s"]:.0f}s) - 지금 자리에서 완료 처리')
+            self._set('HOLD', now)
+            return 0.0, 1.0, 0.0, R
         if st == 'IDLE':
             self._set('APPROACH', now)
             st = 'APPROACH'
@@ -865,7 +894,10 @@ class RearParking(Parking):
                     self._set('HOLD', now)
                 else:
                     if self.tries >= 3:
-                        raise RuntimeError('후면 주차 보정 한도 초과: 슬롯 밖에서 완료 처리하지 않습니다')
+                        # 보정 한도 초과: 더 시도하지 않고 멈춘 자리에서 완료 처리 (예전엔 여기서 RuntimeError로 영구 멈춤)
+                        self.log('rear: 후면 주차 보정 한도 초과 - 지금 자리에서 완료 처리')
+                        self._set('HOLD', now)
+                        return 0.0, 1.0, 0.0, R
                     self.tries += 1
                     hl = p['rpark_slot_len'] / 2 - 0.05 - p['rpark_tol_margin']
                     hw = p['rpark_slot_wid'] / 2 - 0.05 - p['rpark_tol_margin']

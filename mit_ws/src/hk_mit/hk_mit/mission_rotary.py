@@ -69,6 +69,13 @@ CELL_M = 0.5            # 정지물 판정용 격자 크기 (m)
 MAX_RANGE_M = 40.0
 WAIT_FAILSAFE_S = 20.0  # diagnostic timeout only; never enter an occupied merge
 LOG_PERIOD_S = 1.0      # 대기 중 상태 로그 간격 (s)
+# ---- 정지 없이 합류 (rolling entry) ---------------------------------------------------------------
+ROLLING_ENTRY = True    # 정지 위치 ROLL_DECIDE_M 안에서 "도착 시점에 위험 구간이 빈다"가 연속 확인되면 멈추지 않고 진입. False면 항상 정지
+ROLL_DECIDE_M = 12.0    # 정지 위치(뒤차축)까지 이 거리 안에서만 판단 (m): 예측 시간이 짧아 NPC 위치 예측 오차가 작음
+ROLL_CLEAR_FRAMES = 3   # 연속 새 LiDAR 프레임 수
+ROLL_V_NPC = (2.5, 4.5) # NPC 속도 가정 범위 (m/s): 시뮬레이터 2.7~3.9에 여유. 도착 시점 NPC 위치를 이 범위 전체로 봄
+ROLL_DOWN_CLEAR_M = 8.0 # 도착 시점에 진입선 하류 이 호 길이 안에 NPC가 있으면 위험 (앞차 바로 뒤에 끼어들지 않음)
+ROLL_LATENCY_S = 0.3    # 도착 시간에 더하는 여유 (조향·구동 지연)
 # ---- 진입 후 -----------------------------------------------------------------------------------
 GO_SPEED = 5.75         # 진입 후 속도 한계 (m/s): 5.5 ~ 6.0
 FOLLOW_SPEED = 2.5      # 앞차를 따라잡았을 때 속도 한계 (m/s)
@@ -104,6 +111,7 @@ class RotaryMission(MissionBase):
         self.cell_hist = deque(maxlen=STATIC_FRAMES)   # 최근 프레임들의 회전 차선 밴드 안 점이 잡힌 격자 칸
         self.last_log = -1e9
         self.timeout_warned = False
+        self.roll_clear = 0        # 정지 없이 합류: 도착 시점 위험 구간이 비어 있던 연속 프레임 수
 
     def on_enter(self, section):
         self.reset()
@@ -227,6 +235,21 @@ class RotaryMission(MissionBase):
         out['danger'] = near_up >= MIN_DANGER_POINTS or down >= MIN_DANGER_POINTS
         return out
 
+    def _assess_rolling(self, xy, t_arr):
+        """정지하지 않고 진입할 때: 도착 시점(t_arr초 뒤)에 위험 구간 [-u_safe, ROLL_DOWN_CLEAR_M]에 들어올 수 있는 NPC 점 수.
+        NPC 속도를 ROLL_V_NPC 범위로 가정해, 각 점이 도착 시점에 있을 수 있는 호 길이 구간 전체가 위험 구간과 겹치는지 봅니다."""
+        g = self.geo
+        if len(xy) == 0:
+            return 0
+        rr = np.hypot(xy[:, 0] - g['cx'], xy[:, 1] - g['cy'])
+        pts = xy[np.abs(rr - g['R']) <= BAND]
+        if len(pts) == 0:
+            return 0
+        arc = wrap_arr(np.arctan2(pts[:, 1] - g['cy'], pts[:, 0] - g['cx']) - g['theta_entry']) * g['R']
+        u_safe = min(max(ROLL_V_NPC[1] * T_CLEAR, U_SAFE_MIN), U_SAFE_MAX)
+        lo, hi = arc + ROLL_V_NPC[0] * t_arr, arc + ROLL_V_NPC[1] * t_arr
+        return int(((hi >= -u_safe) & (lo <= ROLL_DOWN_CLEAR_M)).sum())
+
     @staticmethod
     def _fmt(a):
         up = '없음' if a['up'] is None else f"{a['up']:.1f}m"
@@ -317,6 +340,18 @@ class RotaryMission(MissionBase):
             if not at_line:
                 self.wait_since = None
                 self.clear_frames = 0
+            dist = stop_rear - s_ego
+            if ROLLING_ENTRY and not at_line and new_frame and 0.0 < dist <= ROLL_DECIDE_M and inp.speed > 1.0:
+                t_arr = dist / max(inp.speed, 1.0) + ROLL_LATENCY_S      # 정지 위치 도착까지 걸릴 시간
+                n_danger = self._assess_rolling(xy, t_arr)
+                self.roll_clear = 0 if n_danger >= MIN_DANGER_POINTS else self.roll_clear + 1
+                if self.roll_clear >= ROLL_CLEAR_FRAMES:                 # 도착 시점에 비어 있음이 연속 확인됨: 멈추지 않고 합류
+                    self.entered = True
+                    if self.log:
+                        self.log.info(f'로터리 진입: 도착 {t_arr:.1f}s 뒤 위험 구간 비어 있음 ({self.roll_clear}프레임 연속) - 정지 없이 합류')
+                    return self._inside(inp, xy, s_front)
+            else:
+                self.roll_clear = 0
 
         # 접근 속도 한계: 정지 위치까지 남은 거리에서 A_DECEL로 멈출 수 있는 속도 (V_FLOOR 이상)
         path = self._with_limits(inp.local_path, lambda s_p: max(math.sqrt(2.0 * A_DECEL * max(stop_rear - s_p, 0.0)), V_FLOOR))
