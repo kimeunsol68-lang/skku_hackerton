@@ -52,7 +52,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from nav_msgs.msg import Odometry, Path
 from hk_interfaces.msg import CtrlCmd
 
-from .course import COURSE_DIR
+from .course import COURSE_DIR, load_options, option_on
 from .sim_events import SimEvents
 
 # 조정할 값은 config/bringup.yaml의 파라미터입니다(공식 주행 직전에는 코드가 아니라 이 파일만 바꿀 수 있음).
@@ -140,6 +140,9 @@ class Control(Node):
 
     # ---- 시작·복귀 -----------------------------------------------------------------------------------
     def on_reset(self, checkpoint, reload):
+        if reload:                                   # 새 시도 시작: 이번에 켜진 옵션에 맞게 구역 제한을 다시 정함
+            self.zones = self.load_zones()
+            self._curv_src = None
         self.reset_control()
         self.odom = self.path = None
         self.override = None
@@ -149,12 +152,20 @@ class Control(Node):
         self.active = True
 
     def load_zones(self):
-        """course.json의 저마찰(low_friction)·경사(slope) 구간 다각형. 못 읽으면 빈 dict (구간 대응만 꺼짐)."""
+        """course.json의 저마찰(low_friction)·경사(slope)·장애물 구간 다각형. 못 읽으면 빈 dict (구간 대응만 꺼짐).
+        시뮬레이터가 이번 시도에서 켠 옵션(/data/current/course.json)에 든 구역만 돌려줍니다: 꺼진 옵션의 구역은 평소 속도로 달립니다.
+        옵션을 못 읽으면 모든 구역 대응을 켭니다."""
         path = self.get_parameter('course_json').value or str(COURSE_DIR / 'course.json')
         try:
             with open(path, encoding='utf-8') as f:
                 missions = json.load(f)['course']['missions']
-            kinds = ('low_friction' if self.lowmu_enabled else None, 'slope', 'obstacle1', 'obstacle3')
+            options = load_options(self.get_parameter('course_json').value or None)
+            kinds = tuple(k for k in ('low_friction', 'slope', 'obstacle1', 'obstacle3')
+                          if option_on(options, k) and (k != 'low_friction' or self.lowmu_enabled))
+            if getattr(self, '_zone_kinds', None) != kinds:
+                self._zone_kinds = kinds
+                self.get_logger().info(f'속도 제한을 적용하는 구역: {", ".join(kinds) or "없음"}'
+                                       + ('' if options is not None else ' (옵션 파일을 못 읽어 전부 켬)'))
             return {m['type']: [tuple(p) for p in m['zone']] for m in missions
                     if m.get('type') in kinds and m.get('zone')}
         except Exception as e:

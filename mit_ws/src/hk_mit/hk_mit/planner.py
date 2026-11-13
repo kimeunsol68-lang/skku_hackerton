@@ -25,7 +25,7 @@ from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import LaserScan
 from hk_interfaces.msg import CtrlCmd
 
-from .course import COURSE_DIR, declare_file_params, load_route, Route
+from .course import COURSE_DIR, declare_file_params, load_options, load_route, option_on, Route
 from .cp_manager import CPManager
 from .mission_manager import MissionManager
 from .sim_events import SimEvents
@@ -99,6 +99,8 @@ class Planner(Node):
         """course.json의 obstacle3 구역 다각형. 못 읽으면 None (속도 제한만 꺼짐)."""
         if float(self.get_parameter('obstacle3_speed').value) <= 0.0:
             return None
+        if not option_on(load_options(self.get_parameter('course_json').value or None), 'obstacle3'):
+            return None                                    # 이번 시도에서 장애물 3개 옵션이 꺼져 있으면 속도를 낮출 필요 없음
         path = self.get_parameter('course_json').value or str(COURSE_DIR / 'course.json')
         try:
             with open(path, encoding='utf-8') as f:
