@@ -7,8 +7,9 @@
 
 동작 (20 Hz): "가장 가까운 아직 안 지나친 장애물 1개씩" 순차 회피
     1. 감지: LiDAR(LaserScan, lidar_link)를 차 자세와 장착 위치(뒤차축 기준 앞 1.15 m)로 map 좌표로 바꾸고, 전역 경로(route.csv)
-       기준 Frenet (s: 누적 거리, d: 중심선 기준 왼쪽 +)로 바꿉니다. |d| < 3.2 m(도로 벽 제외), s_ego-1.5 ~ s_ego+18 m, 미션 zone
-       안의 점을 0.9 m 이내끼리 묶어 3점 미만은 버리고, 묶음의 중심 (s, d)와 범위를 구합니다.
+       기준 Frenet (s: 누적 거리, d: 중심선 기준 왼쪽 +)로 바꿉니다. 먼저 반경 안에 이웃 점이 없는 고립된 점(LiDAR 노이즈)을 지우고
+       (lidar_perception.density_mask), |d| < 3.2 m(도로 벽 제외), s_ego-1.5 ~ s_ego+24 m, 미션 zone 안의 점을 0.9 m 이내끼리 묶어
+       4점 미만이거나 폭이 0.3 m 미만인 뭉치는 버리고, 묶음의 중심 (s, d)와 범위를 구합니다.
     2. 추적: 같은 물체를 여러 프레임에 걸쳐 map 좌표로 추적합니다. 한 프레임이라도 잡히면 즉시 확정하고, 그때 회피 방향을 고정합니다:
        중심선 왼쪽(d >= 0, side > 0)이면 오른쪽 차선 d_target = -2.05 m, 오른쪽이면 왼쪽 차선 d_target = +2.05 m.
        다른 장애물에 가려져 점이 안 들어와도 장애물을 지나치기 전에는 추적을 지우지 않고 기억합니다(최소 2.5 s 이상).
@@ -37,6 +38,7 @@ import math
 
 import numpy as np
 
+from .lidar_perception import density_mask
 from .mission_base import MissionBase, MissionInput, MissionOutput
 
 # ---- 차량·센서 (IONIQ 5) -------------------------------------------------------------------------
@@ -49,7 +51,8 @@ AHEAD_M = 24.0          # 차 앞 이만큼까지 (m). 앞 장애물에 가려�
 MAX_RANGE_M = 40.0      # LiDAR 점 최대 거리 (m)
 ZONE_MARGIN_M = 2.0     # 미션 zone 바깥 이만큼까지 후보로 인정 (m)
 CLUSTER_DIST = 0.9      # 같은 장애물로 묶는 거리 (m)
-MIN_POINTS = 3          # 이보다 적은 묶음은 노이즈
+MIN_POINTS = 4          # 이보다 적은 묶음은 노이즈 (LiDAR 노이즈 옵션 대비)
+MIN_WIDTH = 0.3         # 폭이 이보다 좁은 점 뭉치는 노이즈 (m)
 ASSOC_DIST = 1.8        # 추적 중인 장애물과 같은 물체로 보는 거리 (m)
 ASSOC_PAD = 0.8         # 추적 중인 장애물의 범위 안팎 이만큼 이내에 들어오면 같은 물체 (m)
 NEW_MIN_AHEAD = 0.3     # 새 장애물은 차보다 이만큼 앞에서만 만듦 (지나친 장애물의 뒷면 조각이 새 장애물이 되는 것 방지)
@@ -119,6 +122,7 @@ class ObstacleMission(MissionBase):
     def __init__(self, logger=None):
         self.pts = None            # 전역 경로 (N, 2), 처음 쓸 때 읽음
         self.lidar = (LIDAR_X, LIDAR_Y, LIDAR_YAW)
+        self._dens_key = self._dens = None   # 같은 스캔은 고립점 필터를 한 번만
         super().__init__(logger)
 
     def reset(self):
@@ -171,6 +175,12 @@ class ObstacleMission(MissionBase):
         ok = np.isfinite(r) & (r >= max(scan.range_min, 0.3)) & (r <= min(scan.range_max, MAX_RANGE_M))
         if not ok.any():
             return []
+        key = (scan.header.stamp.sec, scan.header.stamp.nanosec)
+        if key != self._dens_key:                                      # 반경 안에 이웃 점이 없는 고립된 점(LiDAR 노이즈)은 지움
+            self._dens_key, self._dens = key, density_mask(r, ang, scan.angle_increment, ok)
+        ok &= self._dens
+        if not ok.any():
+            return []
         lx, ly, lyaw = self.lidar
         ox = inp.x + math.cos(inp.yaw) * lx - math.sin(inp.yaw) * ly
         oy = inp.y + math.sin(inp.yaw) * lx + math.cos(inp.yaw) * ly
@@ -207,6 +217,8 @@ class ObstacleMission(MissionBase):
             if len(members) < MIN_POINTS:
                 continue
             m = np.asarray(members)
+            if math.hypot(float(np.ptp(xy[m, 0])), float(np.ptp(xy[m, 1]))) < MIN_WIDTH:   # 너무 좁은 뭉치는 노이즈
+                continue
             out.append((float(s[m].mean()), float(d[m].mean()), float(s[m].min()), float(s[m].max()),
                         float(d[m].min()), float(d[m].max()), float(xy[m, 0].mean()), float(xy[m, 1].mean())))
         return out

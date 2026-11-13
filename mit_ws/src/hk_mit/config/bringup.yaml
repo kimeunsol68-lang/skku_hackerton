@@ -4,7 +4,7 @@ hk_mit_localization:
     course_json: ""               # 출발·복귀 자세와 지도 원점
 hk_mit_planner:
   ros__parameters:
-    ahead_m: 30.0                 # 차 앞으로 내보낼 경로 길이 (m)
+    ahead_m: 40.0  # 차 앞으로 내보낼 경로 길이 (m). 저마찰 구역 앞 15 m + 감속 거리를 미리 보려고 30 -> 40
     behind_m: 2.0                 # 차 뒤로 남길 경로 길이 (m)
     route_csv: ""                 # 전역 경로 (0.5 m 간격)
     missions_enabled: true        # false: 미션 모듈(주차·장애물·로터리)을 부르지 않고 기본 경로만 따라감
@@ -14,11 +14,18 @@ hk_mit_control:
   ros__parameters:
     # --- 속도 프로파일 (곡률 기반). 주의: launch의 target_speed 인자는 프로파일을 쓰는 동안 무시됩니다 ---
     profile_enabled: 1.0          # 1: 곡률 기반 속도 프로파일, 0: target_speed 하나로 (예전 방식)
-    v_max: 12.0                   # 직선 최고 속도 (m/s)
+    v_max: 12.5  # 직선 최고 속도 (m/s)
     v_min: 4.5                    # 급커브에서도 이 밑으로는 줄이지 않음 (m/s)
-    a_lat_max: 3.2                # 코너에서 허용할 횡가속도 (m/s²). 미끄러지면 낮추기 (R=7 m 코너 -> 약 4.8 m/s)
-    a_decel: 2.6                  # 코너 진입 전 미리 감속하는 세기 (m/s²). 작을수록 일찍 감속
-    curv_window_m: 3.0            # 곡률을 잴 때 앞뒤로 보는 길이 (m)
+    a_lat_normal: 4.2  # 일반 노면에서 코너에 허용할 횡가속도 (m/s²). R=7 m 코너 -> 약 5.4 m/s
+    a_decel: 3.5  # 일반 노면 코너 진입 전 감속 세기 (m/s²). 작을수록 일찍 감속
+    menger_step: 3.0              # 세 점 외접원(Menger) 곡률의 점 간격 (점 개수, 0.5 m 간격이면 1.5 m)
+    curv_smooth: 5.0              # 곡률 이동평균 창 (점 개수)
+    curv_lookahead_m: 4.0         # 유효 곡률 = 전방 이 거리(m) 안의 최대 |곡률|
+    curv_lookahead_lowmu_m: 2.5   # 저마찰 구역의 유효 곡률 전방 탐색 거리 (m). 짧게 잡아 정점을 벗어나자마자 직선으로 인식
+    curv_ff_gain: 1.0             # 곡률 앞먹임 조향 세기 (0이면 끔)
+    curv_ff_mode: 0.0             # 0: 곡률 변화분만 앞먹임(기본, Stanley와 이중 반영 방지), 1: atan(L x 곡률) 전체
+    ff_lookahead_s: 0.6           # 앞먹임이 내다보는 시간 (s)
+    ff_lookahead_min_m: 2.0       # 앞먹임이 내다보는 최소 거리 (m)
     brake_ff_decel: 4.0           # 앞먹임 제동: brake=1일 때 감속 추정 (m/s²). 0이면 끔
     brake_ff_lookahead_s: 0.8     # 앞먹임 제동이 내다보는 시간 (s)
     speed_lead_s: 0.25            # 구동·제동 지연 보상: 이 시간만큼 앞의 목표 속도를 씀 (s). 지연 옵션을 끄면 0.0~0.1
@@ -27,21 +34,28 @@ hk_mit_control:
     v_max_obstacle: 3.5           # 장애물 구간(obstacle1/obstacle3 zone) 안 최고 속도 (m/s). 12로 두면 제한 없음
     obstacle_lead_m: 12.0         # 장애물 구역 입구 이만큼(m) 앞에서부터 v_max_obstacle로 달림
     lowmu_enabled: 1.0            # 1: 저마찰 구역 대응 켬, 0: 끔. 시뮬레이터 저마찰 옵션을 끄고 달릴 때는 0.0
-    a_lat_lowmu: 0.95             # 횡가속도 한계 (m/s²). μ=0.2 한계(약 1.96)의 절반 이하. R=7 m 코너 -> 약 2.6 m/s
-    v_min_lowmu: 2.3              # 이 구간의 최저 속도 (m/s)
-    v_max_lowmu: 5.0              # 이 구간의 최고 속도 (m/s)
-    a_decel_lowmu: 1.0            # 이 구간의 감속 계획 (m/s²). 작을수록 일찍 감속
-    accel_max_lowmu: 0.3          # 이 구간의 구동 상한 (0~1)
-    brake_max_lowmu: 0.35         # 이 구간의 제동 상한 (0~1). 바퀴 잠김 방지
+    a_lat_lowmu: 1.55  # μ=0.2 한계(약 1.96)의 79% 횡가속도 (m/s²). R=7 m 코너 -> 약 3.3 m/s. 미끄러지면 1.25로
+    v_min_lowmu: 3.1  # 이 구간 급커브 정점의 최저 속도 (m/s)
+    v_max_lowmu: 8.0  # 이 구간의 최고 속도 (m/s). S자 사이의 짧은 직선에서 허용
+    a_decel_lowmu: 1.45  # 이 구간(진입 전 lowmu_dec_lead_m 포함)의 감속 계획 (m/s²). μ=0.2 한계의 74%
+    accel_max_lowmu: 0.4  # 이 구간의 구동 상한 (0~1). a_acc_lowmu 1.65를 따라갈 수 있게 0.3에서 올림
+    brake_max_lowmu: 0.4  # 이 구간의 제동 상한 (0~1). 앞먹임 제동(약 0.36)이 잘리지 않게 0.35에서 올림
     steer_rate_lowmu: 6.0         # 이 구간의 조향 변화율 한계 (1/s). 사실상 제한 없음. 방향이 바뀔 때는 항상 즉시 추종
-    lowmu_lead_m: 12.0            # 저마찰 구역 앞 이만큼(m)부터 저마찰 속도 한계 적용 (구역 경계 오차 대비)
-    k_stanley_lowmu: 2.0          # 저마찰 구간 Stanley 옆오차 이득
+    a_acc_lowmu: 1.65  # 이 구간의 가속 계획 (m/s²). 휠스핀이 나면 1.2로. 구역을 나가면 제한 없이 일반 속도로 복귀
+    lowmu_lat_lead_m: 5.0  # 저마찰 구역 앞 이만큼(m)부터 저마찰 횡가속도 한계 적용
+    lowmu_dec_lead_m: 5.0  # 저마찰 구역 앞 이만큼(m)부터 저마찰 감속 계획 적용
+    k_stanley_lowmu: 2.4  # 저마찰 구간 Stanley 옆오차 이득
     k_soft_lowmu: 0.3             # 저마찰 구간 Stanley 저속 완화값 (m/s). 작을수록 저속에서 적극적
     k_heading_lowmu: 1.0          # 저마찰 구간 방향 오차(전방 주시) 가중치
     # --- 경사 구간 (course.json의 slope zone 안에서만 적용) ---
     v_max_slope: 8.0              # 이 구간의 최고 속도 (m/s). 내리막 과속 방지
     slope_ki_mult: 2.0            # 이 구간의 적분 이득 배수 (오르막 처짐·내리막 과속을 빨리 보정)
+    a_lat_slope: 2.0              # 경사 구역 주변 코너 횡가속도 (m/s²). R=6 m S자 -> 약 3.5 m/s. 벽에 닿으면 1.6으로, 여유 있으면 2.4로
+    v_min_slope: 3.2              # 경사 구역 주변 급커브의 최저 속도 (m/s)
+    slope_margin_m: 18.0          # 경사 구역 사방으로 이만큼(m) 넓힌 영역에 위 값을 적용 (경로의 CP3~CP5 S자 전체)
     # --- 속력 PI 전환 / 조향 변화율 (구간 밖에서도) ---
+    steer_ema_alpha: 0.65         # 조향 출력 지수이동평균 (1이면 끔). 노이즈 옵션에서 핸들이 떨 때 낮추기
+    cross_deadzone_m: 0.05        # 횡방향 오차 데드존 (m). 좁은 도로에서 정밀도가 모자라면 0으로
     brake_on: 0.10                # 구동 -> 제동 전환 문턱 (PI 출력이 -brake_on 아래일 때)
     brake_off: 0.03               # 제동 -> 구동 복귀 문턱. brake_on보다 작게 둬야 경계에서 떨지 않음
     steer_rate_max: 8.0           # 조향 변화율 한계 (1/s). 사실상 제한 없음. 방향이 바뀔 때는 항상 즉시 추종

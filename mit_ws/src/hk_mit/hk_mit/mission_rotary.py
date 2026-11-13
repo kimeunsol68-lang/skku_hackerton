@@ -14,7 +14,7 @@
        범퍼가 정지선에 닿으면 override_cmd = (0, 1, steer, 'D')로 완전히 정지해 기다립니다.
        (처음 지시한 s_entry - 1.5 m는 시뮬레이터 NPC 모델로 재 보니 정지한 차 앞 범퍼와 지나가는 NPC 사이가 0.77 m뿐이고, 정지
         오차가 조금만 있어도 닿아서 3.0 m 앞으로 물렸습니다.)
-    3. NPC 감지: LaserScan(lidar_link)을 차 자세와 장착 위치(뒤차축 기준 앞 1.15 m)로 map 좌표로 바꾸고, 원의 차선 밴드
+    3. NPC 감지: LaserScan(lidar_link)에서 고립된 점(LiDAR 노이즈)을 지운 뒤 차 자세와 장착 위치(뒤차축 기준 앞 1.15 m)로 map 좌표로 바꾸고, 원의 차선 밴드
        (반지름 R-1.8 ~ R+1.8 m) 안의 점을 NPC로 봅니다 (중앙 섬·외곽 벽은 반경 필터로 제외).
        점마다 진입선 기준 호 길이 dθ·R을 구합니다 (음수 = 상류, 다가오는 쪽). 위험 조건:
          - 상류: 가장 가까운 NPC까지 호 길이가 u_safe 안 (u_safe = 측정한 NPC 속도 x 3.7 s, 9~15 m로 제한. 속도를 못 재면 3.5 m/s로 가정
@@ -38,6 +38,7 @@ from collections import Counter, deque
 
 import numpy as np
 
+from .lidar_perception import density_mask
 from .mission_base import MissionBase, MissionInput, MissionOutput
 
 # ---- 차량·센서 (IONIQ 5) -------------------------------------------------------------------------
@@ -61,7 +62,7 @@ DOWNSTREAM_M = 1.5      # 진입선 하류 이 호 길이 안의 NPC(아직 진�
 T_CLEAR = 3.7           # 정지 상태에서 출발해 합류를 마치는 데 필요한 시간 + 여유 (s). 상류 NPC가 이 시간 안에 도착하면 위험
 U_SAFE_MIN, U_SAFE_MAX = 9.0, 15.0   # 상류 안전 호 길이 범위 (m) = clamp(NPC 속도 x T_CLEAR)
 V_NPC_DEFAULT = 3.5     # NPC 속도를 못 쟀을 때 가정 (m/s). 시뮬레이터 설정은 3.0 m/s x 시드 배율 0.9~1.3 = 2.7~3.9 m/s
-MIN_DANGER_POINTS = 2   # 위험 구간 안의 점이 이 개수 이상이어야 NPC로 봄 (낱개 노이즈 무시)
+MIN_DANGER_POINTS = 4   # 위험 구간 안의 점이 이 개수 이상이어야 NPC로 봄 (낱개 노이즈 무시, LiDAR 노이즈 옵션 대비)
 CLEAR_FRAMES = 2        # 위험 구간이 이만큼 연속 새 프레임 동안 비면 출발
 STATIC_FRAMES = 30      # 정지물 판정에 쓰는 최근 프레임 수 (10 Hz에서 3 s)
 STATIC_FRAC = 0.9       # 이 비율 이상의 프레임에서 같은 칸에 계속 잡히면 정지물(벽 등)로 보고 제외
@@ -88,6 +89,7 @@ class RotaryMission(MissionBase):
 
     def __init__(self, logger=None):
         self.pts = None            # 전역 경로 (N, 2), 처음 쓸 때 읽음
+        self._dens_key = self._dens = None   # 같은 스캔은 고립점 필터를 한 번만
         self.geo = None
         self.lidar = (LIDAR_X, LIDAR_Y, LIDAR_YAW)
         super().__init__(logger)
@@ -174,6 +176,10 @@ class RotaryMission(MissionBase):
         r = np.asarray(scan.ranges, dtype=float)
         ang = scan.angle_min + np.arange(len(r)) * scan.angle_increment
         ok = np.isfinite(r) & (r >= max(scan.range_min, 0.3)) & (r <= min(scan.range_max, MAX_RANGE_M))
+        key = (scan.header.stamp.sec, scan.header.stamp.nanosec)
+        if key != self._dens_key:                                      # 반경 안에 이웃 점이 없는 고립된 점(LiDAR 노이즈)은 지움
+            self._dens_key, self._dens = key, density_mask(r, ang, scan.angle_increment, ok)
+        ok &= self._dens
         lx, ly, lyaw = self.lidar
         ox = inp.x + math.cos(inp.yaw) * lx - math.sin(inp.yaw) * ly
         oy = inp.y + math.sin(inp.yaw) * lx + math.cos(inp.yaw) * ly

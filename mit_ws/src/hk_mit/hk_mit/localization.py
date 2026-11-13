@@ -30,7 +30,12 @@ DEFAULTS = {
     'gps_bias_tau': 10.0,           # GNSS 공통 오차의 시간 상관 길이 (s)
     'gps_update_period': 0.15,      # 상관된 GPS를 과신하지 않도록 보정 간격 제한 (s)
     'gps_gate': 25.0,               # 정규화한 2차원 위치 잔차 제곱의 상한
-    'max_gps_step': 0.25,           # GNSS 보정 한 번의 최대 위치 이동 (m)
+    'max_gps_step': 0.12,           # GNSS 보정 한 번의 최대 위치 이동 (m). 0.15 s마다 한 번이면 최대 0.8 m/s: 음영 탈출 직후에도 위치가 튀지 않음
+    'gyro_clip': 1.5,               # 이보다 큰 각속도(rad/s)는 스파이크로 보고 이 값으로 자름
+    'gyro_lpf_hz': 10.0,            # 자이로 z의 1차 저역통과 차단 주파수 (Hz). 100 Hz IMU의 고주파 잡음을 거름, 지연은 약 16 ms
+    'gps_alpha_max': 0.08,          # GNSS 한 번에 위치를 보정하는 최대 비율(칼만 이득 상한). 잡음이 튀어도 위치가 순간이동하지 않게
+    'gps_heading_min_speed': 1.5,   # 이보다 느리면 GNSS로 방향·자이로 편향을 보정하지 않음 (m/s). 저속 GNSS 방향은 잡음이 큼
+    'gps_max_sigma': 8.0,           # GNSS가 알려 주는 위치 표준편차가 이보다 크면(음영 등) 그 측정은 버림 (m)
     'position_noise': 0.035,        # 이동 모델 위치 불확실성 (m/sqrt(s))
     'gyro_noise': 0.004,            # 방향 예측 불확실성 (rad/sqrt(s))
     'bias_walk': 0.00012,           # IMU 편향 변화 불확실성 (rad/s/sqrt(s))
@@ -172,7 +177,17 @@ class PoseFilter:
     def imu(self, timestamp, rate):
         if not math.isfinite(rate) or not self.advance(timestamp):
             return
-        self.rate, self.imu_time = float(rate), timestamp
+        if abs(rate) > self.cfg['gyro_clip']:                 # 비정상적인 각속도 스파이크는 자름
+            rate = math.copysign(self.cfg['gyro_clip'], rate)
+            self.counts['gyro_clipped'] += 1
+        raw = float(rate)
+        if self.imu_time is not None and 0.0 < timestamp - self.imu_time <= self.cfg['sensor_timeout']:
+            alpha = 1.0 - math.exp(-2.0 * math.pi * self.cfg['gyro_lpf_hz'] * (timestamp - self.imu_time))
+            self.rate += alpha * (raw - self.rate)                # 1차 저역통과: 예측에 쓰는 각속도의 고주파 잡음만 거름
+        else:
+            self.rate = raw
+        self.imu_time = timestamp
+        rate = raw                                                # 정지 중 영점 보정은 필터 지연 없는 원 값으로
         if (self.still_since is not None and timestamp - self.still_since >= 0.15
                 and self.wheel_time is not None and timestamp - self.wheel_time < 0.1
                 and abs(rate) < 0.1):
@@ -208,9 +223,10 @@ class PoseFilter:
             measurement_cov *= score / 9.0
             innovation_cov = measurement @ self.cov @ measurement.T + measurement_cov
         gain = np.linalg.solve(innovation_cov, measurement @ self.cov).T
+        gain[:2, :] = np.clip(gain[:2, :], -self.cfg['gps_alpha_max'], self.cfg['gps_alpha_max'])   # 위치 보정 비율 상한 (Joseph 형태라 공분산은 그대로 일관)
         speed, _ = self.motion(timestamp)
-        if abs(speed) < 0.3:
-            gain[2:4, :] = 0.0  # 정지 중 위치 잡음으로 방향·자이로 편향을 바꾸지 않음
+        if abs(speed) < self.cfg['gps_heading_min_speed']:
+            gain[2:4, :] = 0.0  # 저속·정지 중 위치 잡음으로 방향·자이로 편향을 바꾸지 않음 (IMU 적분만 믿음)
         delta = gain @ innovation
         scale = min(1.0, self.cfg['max_gps_step'] / max(np.linalg.norm(delta[:2]), 1e-12),
                     math.radians(1.0) / max(abs(delta[2]), 1e-12))
@@ -227,7 +243,7 @@ class PoseFilter:
         self.gps_history.append((timestamp, x, y, *self.dead_pose))
         while self.gps_history and timestamp - self.gps_history[0][0] > self.cfg['heading_window']:
             self.gps_history.popleft()
-        if (len(self.gps_history) < 12 or abs(self.speed) < 0.5
+        if (len(self.gps_history) < 12 or abs(self.speed) < self.cfg['gps_heading_min_speed']
                 or (self.last_heading_update is not None
                     and timestamp - self.last_heading_update < self.cfg['heading_period'])):
             return
@@ -370,6 +386,11 @@ class Localization(Node):
                 or not -90 <= message.latitude <= 90 or not -180 <= message.longitude <= 180):
             self.received['invalid'] += 1
             return
+        if message.position_covariance_type in (1, 2, 3):      # GNSS가 위치 불확실성을 알려 주면 너무 큰 측정은 버림
+            variance = max(message.position_covariance[0], message.position_covariance[4])
+            if math.isfinite(variance) and variance > 0 and math.sqrt(variance) > self.cfg['gps_max_sigma']:
+                self.received['gps_uncertain'] += 1
+                return
         x, y = ll_to_map(message.latitude, message.longitude, self.course.origin)
         self.enqueue('gps', message, (x, y))
 

@@ -14,17 +14,18 @@ localization.py의 /hk/local/odom(위치·방향·속력)과 planner.py의 /hk/p
 노면·지연·경사도 따로 생각하지 않습니다. 속도를 올리거나 옵션을 켜면서 직접 고쳐 보세요.
 
 속도 프로파일 (profile_enabled: true, 기본)
-  local_path 점들의 곡률로 구간별 속도 한계 v = sqrt(a_lat_max / |곡률|)을 구하고(v_min ~ v_max로 제한),
+  local_path 점들의 곡률로 구간별 속도 한계 v = sqrt(a_lat_normal / |곡률|)을 구하고(v_min ~ v_max로 제한),
   뒤에서 앞으로 a_decel 한계의 감속을 전파해 "코너 진입 전에 미리 감속"하는 목표 속도 프로파일을 만듭니다.
   직선은 v_max까지 가속합니다. 조향은 지금까지처럼 Stanley입니다.
   코너 앞에서는 프로파일이 요구하는 감속을 brake_ff_decel로 환산한 앞먹임 제동을 PI에 더합니다.
 
 저마찰·경사·좁은 도로 대응 (course.json의 low_friction·slope zone 다각형을 읽어 그 안에서만 적용)
-  저마찰 구간(μ=0.2 기준): 횡가속도 한계(a_lat_lowmu)로 급커브 속도를 2.3~2.7 m/s로 낮추고, 구역 앞 lowmu_lead_m부터
-  a_decel_lowmu로 감속 계획을 세워 진입할 때 이미 느리게 합니다. 구동·제동 상한(accel_max_lowmu, brake_max_lowmu)으로
+  저마찰 구간(μ=0.2 기준): 횡가속도 한계(a_lat_lowmu)로 급커브 정점(R=7 m 코너 약 3.3 m/s)만 낮추고 직선·변곡점은 빠르게 달립니다.
+  구역 앞 lowmu_dec_lead_m(5 m)부터 a_decel_lowmu로 감속 계획을 세워 진입할 때 이미 느리게 합니다. 구동·제동 상한(accel_max_lowmu, brake_max_lowmu)으로
   바퀴가 미끄러지거나 잠기지 않게 합니다. 조향은 변화율 제한을 사실상 풀었고(steer_rate_*), 방향이 바뀔 때는 제한 없이
   즉시 따라가며, Stanley 이득을 저마찰용(k_stanley_lowmu, k_soft_lowmu, k_heading_lowmu)으로 따로 둡니다.
-  경사 구간: 최고 속도 v_max_slope, 적분 이득 배수 slope_ki_mult. 속력 PI는 적분 누적 방지(anti-windup)와 구동/제동 전환
+  경사 구간: 최고 속도 v_max_slope, 적분 이득 배수 slope_ki_mult. 경사 구역 사방 slope_margin_m(18 m) 안의 코너는 a_lat_slope로 더 여유 있게
+  (경로의 CP4~CP5는 경사 위의 R=6 m S자: 약 3.5 m/s). 속력 PI는 적분 누적 방지(anti-windup)와 구동/제동 전환
   히스테리시스(brake_on/brake_off)를 씁니다.
   좁은 도로: Stanley가 경로에 맞추는 점을 앞바퀴 축(3.0 m)보다 약간 뒤(track_point_m)로 잡아, 코너에서 차 앞 모서리는 바깥으로
   덜 나가고 뒤 모서리는 안쪽으로 덜 파고들게(두 값의 큰 쪽이 작아지게) 합니다.
@@ -36,15 +37,20 @@ localization.py의 /hk/local/odom(위치·방향·속력)과 planner.py의 /hk/p
   구동·제동: speed_lead_s초 앞의 목표 속도를 쓰고, a_decel을 낮추고 brake_ff_lookahead_s를 늘려 감속을 일찍 시작합니다.
   주의: bringup.launch.py의 target_speed 인자(기본 5.0)는 프로파일을 쓰는 동안 무시됩니다. 최고 속도는 yaml의 v_max입니다.
   profile_enabled: false면 예전처럼 target_speed 하나로 달립니다.
+  곡률은 세 점 외접원(Menger)을 이동평균으로 스무딩해 구하고, 유효 곡률은 전방 4 m(저마찰 구역은 2.5 m) 안의 최대값입니다. 저마찰 구역에서는
+  횡가속도 a_lat_lowmu(구역 + 앞 5 m), 감속 a_decel_lowmu(구역 + 앞 5 m), 가속 a_acc_lowmu(구역 안)를 따로 씁니다.
+  조향에는 곡률 앞먹임(curv_ff_*)을 더합니다.
 
 미션 직접 제어 (override): planner.py의 미션 스위치가 /hk/mission/override_cmd(CtrlCmd)를 내는 동안에는
 drive() 대신 그 명령(구동·제동·조향·기어)을 그대로 보냅니다. override_timeout_s(기본 0.2 s) 동안 새 명령이 없으면
 평소 제어(Stanley + PI)로 돌아가며, 이때 PI 적분값을 비웁니다. 미션이 아무것도 내지 않으면 원래와 똑같이 동작합니다.
 """
+import bisect
 import json
 import math
 from collections import deque
 
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
@@ -66,36 +72,50 @@ PARAMS = {
     'ki': 0.08,            # 속력 I 이득
     'brake_gain': 0.6,     # 너무 빠를 때 제동 세기
     'profile_enabled': 1.0,   # 1: 곡률 기반 속도 프로파일, 0: target_speed 하나로 (예전 방식)
-    'v_max': 12.0,         # 직선 최고 속도 (m/s)
+    'v_max': 12.5,  # 직선 최고 속도 (m/s)
     'v_min': 4.5,          # 급커브에서도 이 속도 밑으로는 낮추지 않음 (m/s)
-    'a_lat_max': 3.2,      # 코너에서 허용할 횡가속도 (m/s²)
-    'a_decel': 2.6,        # 코너 진입 전에 미리 감속하는 세기 (m/s², 클수록 늦게 감속)
-    'curv_window_m': 3.0,  # 곡률을 잴 때 앞뒤로 보는 길이 (m). 노이즈를 줄임
+    'a_lat_normal': 4.2,  # 일반 노면에서 코너에 허용할 횡가속도 (m/s²)
+    'a_decel': 3.5,  # 일반 노면에서 코너 진입 전에 미리 감속하는 세기 (m/s², 클수록 늦게 감속)
+    'menger_step': 3.0,    # 세 점 외접원(Menger) 곡률에 쓰는 점 간격 (점 개수, 0.5 m 간격이면 3점 = 1.5 m)
+    'curv_smooth': 5.0,    # 곡률 이동평균 창 (점 개수). 노이즈로 곡률이 튀지 않게
+    'curv_lookahead_lowmu_m': 2.5,  # 저마찰 구역(+앞 구간)의 유효 곡률 전방 탐색 거리 (m). 짧게 잡아 코너 정점을 벗어나자마자 직선을 인식하고 가속
+    'curv_lookahead_m': 4.0,  # 유효 곡률 = 지금 점부터 전방 이 거리(m) 안의 최대 |곡률|: S자에서 곧 닥칠 조향 부담을 미리 반영
+    'curv_ff_gain': 1.0,   # 곡률 앞먹임 조향 세기 (0이면 끔)
+    'curv_ff_mode': 0.0,   # 0: 곡률이 바뀌는 만큼만 앞먹임(Stanley가 정상 상태 곡률은 이미 반영하므로 이중 반영 방지), 1: atan(L x 곡률) 전체
+    'ff_lookahead_s': 0.6,   # 앞먹임이 내다보는 시간 (s)
+    'ff_lookahead_min_m': 2.0,   # 앞먹임이 내다보는 최소 거리 (m)
     'brake_ff_decel': 4.0,   # 제동 앞먹임: brake=1일 때의 감속(m/s²) 추정. 크게 잡으면 앞먹임 제동이 약해짐 (0이면 끔)
     'brake_ff_lookahead_s': 0.8,  # 앞먹임 제동이 내다보는 시간 (s)
     'steer_delay_comp': 0.25,   # 조향 지연 보상 시간 (s). 시뮬레이터 조향 지연 옵션이 켜지면 0.25, 꺼지면 0.0
     'speed_lead_s': 0.25,  # 구동 지연 보상: 이 시간만큼 앞의 목표 속도를 씀 (s)
     'override_timeout_s': 0.2,   # 미션 직접 제어 명령이 이 시간 넘게 안 오면 평소 제어로 복귀 (s)
     # --- 저마찰 구간 (course.json의 low_friction zone 안): 보수적 속도·부드러운 조작 ---
-    'a_lat_lowmu': 0.95,   # 횡가속도 한계 (m/s²). μ=0.2 (한계 약 1.96)의 절반 이하. R=7 m 코너 -> 약 2.6 m/s
-    'v_min_lowmu': 2.3,    # 이 구간의 최저 속도 (m/s)
-    'v_max_lowmu': 5.0,    # 이 구간의 최고 속도 (m/s)
-    'a_decel_lowmu': 1.0,  # 이 구간의 감속 계획 (m/s², μ=0.2의 제동 한계 ~1.8보다 작게)
-    'accel_max_lowmu': 0.3,   # 이 구간의 구동 상한 (0~1)
-    'brake_max_lowmu': 0.35,  # 이 구간의 제동 상한 (0~1). 바퀴 잠김 방지
+    'a_lat_lowmu': 1.55,  # μ=0.2 한계(약 1.96)의 79%인 횡가속도 (m/s²). R=7 m 코너 -> 약 3.3 m/s
+    'v_min_lowmu': 3.1,  # 이 구간 급커브 정점의 최저 속도 (m/s)
+    'v_max_lowmu': 8.0,  # 이 구간의 최고 속도 (m/s). S자 사이의 짧은 직선(변곡점)에서 허용
+    'a_decel_lowmu': 1.45,  # 이 구간(진입 전 lowmu_dec_lead_m 포함)의 감속 계획 (m/s²). μ=0.2 한계의 74%
+    'a_acc_lowmu': 1.65,  # 이 구간의 가속 계획 (m/s²). 코너 탈출·변곡점 재가속. 구역을 나가면 제한 없이 일반 속도로 복귀
+    'accel_max_lowmu': 0.4,  # 이 구간의 구동 상한 (0~1). a_acc_lowmu 1.65를 따라갈 수 있게 0.3에서 올림
+    'brake_max_lowmu': 0.4,  # 이 구간의 제동 상한 (0~1). a_decel_lowmu 1.45의 앞먹임 제동(약 0.36)이 잘리지 않게 0.35에서 올림
     'steer_rate_lowmu': 6.0,  # 이 구간의 조향 변화율 한계 (1/s, 1 = 풀 조향). 사실상 제한 없음. 방향이 바뀔 때는 항상 즉시 추종
     # --- 경사 구간 (course.json의 slope zone 안) ---
     'v_max_slope': 8.0,    # 이 구간의 최고 속도 (m/s). 내리막 과속 방지
+    'a_lat_slope': 2.0,    # 경사 구간 주변의 코너 횡가속도 (m/s²). 경사 위 R=6 m S자에서 약 3.5 m/s (경사면 중력이 옆으로 미는 힘 + 좁은 길)
+    'v_min_slope': 3.2,    # 경사 구간 주변 급커브의 최저 속도 (m/s)
+    'slope_margin_m': 18.0,  # 경사 구역 사방으로 이만큼(m) 넓힌 영역(경로의 CP3~CP5 S자 전체)에 위 값을 적용
     'slope_ki_mult': 2.0,  # 이 구간에서 적분 이득 배수 (오르막 처짐·내리막 과속을 빨리 보정)
     # --- 공통 ---
     'steer_rate_max': 8.0,    # 조향 변화율 한계 (1/s). 사실상 제한 없음. 방향이 바뀔 때는 항상 즉시 추종
+    'steer_ema_alpha': 0.65,  # 조향 출력 지수이동평균 계수 (1이면 끔). 0.65면 지연은 약 10 ms: 위치·방향 추정 떨림만 걸러 핸들이 떨지 않게
+    'cross_deadzone_m': 0.05,  # 횡방향 오차가 이 값(m) 안이면 0으로 봄(그 바깥은 이만큼 빼서 연속). 추정 떨림에 핸들이 반응하지 않게
     'brake_on': 0.10,      # 구동 -> 제동으로 바꾸는 문턱 (u가 -brake_on보다 작을 때)
     'brake_off': 0.03,     # 제동 -> 구동으로 되돌리는 문턱 (u가 -brake_off보다 클 때). 떨림 방지
     'v_max_obstacle': 3.5,   # 장애물 구간(obstacle1/obstacle3 zone) 안 최고 속도 (m/s). 미션이 장애물을 찾기 전에도 미리 낮춰 둠
     'obstacle_lead_m': 12.0,  # 장애물 구역 입구 이만큼(m) 앞에서부터 이미 v_max_obstacle로 달리게 함
     'lowmu_enabled': 1.0,  # 1: 저마찰 구역 대응 켬, 0: 끔 (시뮬레이터 저마찰 옵션을 끄고 달릴 때 0으로 두면 원래 속도로 달림)
-    'lowmu_lead_m': 12.0,  # 저마찰 구역 경계가 어긋나도 안전하도록, 구역 앞 이만큼(m)부터 저마찰 속도 한계를 적용
-    'k_stanley_lowmu': 2.0,   # 저마찰 구간 Stanley 옆오차 이득 (저속에서 조향을 끝까지 쓰도록)
+    'lowmu_lat_lead_m': 5.0,  # 저마찰 구역 앞 이만큼(m)부터 저마찰 횡가속도 한계(a_lat_lowmu 등)를 적용
+    'lowmu_dec_lead_m': 5.0,  # 저마찰 구역 앞 이만큼(m)부터 저마찰 감속 계획(a_decel_lowmu)을 적용
+    'k_stanley_lowmu': 2.4,  # 저마찰 구간 Stanley 옆오차 이득 (높아진 코너 속도에서도 바깥으로 안 밀리게)
     'k_soft_lowmu': 0.3,   # 저마찰 구간 Stanley 저속 완화값 (m/s). 작을수록 저속에서 더 적극적
     'k_heading_lowmu': 1.0,   # 저마찰 구간 방향 오차(전방 주시) 가중치
     'track_point_m': 2.6,  # Stanley가 경로에 맞추는 점: 뒤차축에서 앞으로 이만큼 (3.0 = 앞바퀴 축). 줄이면 뒤쪽이 코너 안쪽으로 덜 파고듦
@@ -123,7 +143,8 @@ class Control(Node):
         self.override_active = False
         self.path_vlim = []
         self._curv_src = self._curv = self._s = self._prof = None
-        self._low = self._slope = self._low_plan = self._obst = []
+        self._low = self._slope = self._slope_curve = self._low_lat = self._low_dec = self._obst = []
+        self._k_eff = []
         self._steer_last = 0.0                       # 마지막으로 보낸 조향 (조향 변화율 제한용)
         self._braking = False                        # 구동/제동 전환 히스테리시스 상태
         self._u_sat = 0.0
@@ -166,8 +187,14 @@ class Control(Node):
                 self._zone_kinds = kinds
                 self.get_logger().info(f'속도 제한을 적용하는 구역: {", ".join(kinds) or "없음"}'
                                        + ('' if options is not None else ' (옵션 파일을 못 읽어 전부 켬)'))
-            return {m['type']: [tuple(p) for p in m['zone']] for m in missions
-                    if m.get('type') in kinds and m.get('zone')}
+            zones = {m['type']: [tuple(p) for p in m['zone']] for m in missions
+                     if m.get('type') in kinds and m.get('zone')}
+            if 'slope' in zones:                             # 경사 구역 주변(경로의 S자 전체)을 덮는 넓힌 사각형
+                xs, ys = [p[0] for p in zones['slope']], [p[1] for p in zones['slope']]
+                g = self.slope_margin_m
+                zones['slope_curve'] = [(min(xs) - g, min(ys) - g), (max(xs) + g, min(ys) - g),
+                                        (max(xs) + g, max(ys) + g), (min(xs) - g, max(ys) + g)]
+            return zones
         except Exception as e:
             self.get_logger().warn(f'저마찰·경사 구간을 못 읽어 일반 주행으로만 합니다: {e}')
             return {}
@@ -235,10 +262,11 @@ class Control(Node):
             rate = self.steer_rate_lowmu if low else self.steer_rate_max
             step = rate * self.dt                    # 조향 변화율 제한: 한 번에 이만큼만 바뀜
             want = self.steering(low)
-            if want * self._steer_last < 0.0:        # 조향 방향이 바뀔 때는 제한 없이 바로 따라감 (S자 전환)
+            if want * self._steer_last < 0.0:        # 조향 방향이 바뀔 때는 제한·평활 없이 바로 따라감 (S자 전환)
                 steer = want
             else:
                 steer = clamp(want, self._steer_last - step, self._steer_last + step)
+                steer = self.steer_ema_alpha * steer + (1.0 - self.steer_ema_alpha) * self._steer_last   # 고주파 떨림만 거름
             target = self.speed_target()
         accel, brake = self.longitudinal(target, low, slope)
         return accel, brake, steer
@@ -280,11 +308,14 @@ class Control(Node):
         px, py, path_yaw = self.path[i]
         heading_error = angle_diff(path_yaw, yaw)
         cross_error = -math.sin(path_yaw) * (px - fx) + math.cos(path_yaw) * (py - fy)   # 경로가 왼쪽이면 +
+        cross_error = soft_deadzone(cross_error, self.cross_deadzone_m)             # 추정 떨림(수 cm)에는 반응하지 않음
         if low:                                      # 저마찰 구간: 저속에서도 조향을 끝까지 쓰도록 이득 보강
             wheel_angle = (self.k_heading_lowmu * heading_error
                            + math.atan2(self.k_stanley_lowmu * cross_error, self.k_soft_lowmu + abs(self.speed)))
         else:
             wheel_angle = heading_error + math.atan2(self.k_stanley * cross_error, self.k_soft + self.speed)
+        if self.curv_ff_gain > 0.0:                                  # 곡률 앞먹임: 횡방향 오차가 생긴 뒤에 꺾지 않고 코너 궤적을 선제적으로 추종
+            wheel_angle += self.curv_ff_gain * self.curvature_feedforward(x, y)
         return clamp(wheel_angle / MAX_STEER, -1.0, 1.0)
 
     def predict_pose(self):
@@ -318,43 +349,79 @@ class Control(Node):
         while self.steer_hist and self.steer_hist[0][0] < t - self.steer_delay_comp - 0.5:
             self.steer_hist.popleft()
 
+    def curvature_feedforward(self, x, y):
+        """앞먹임 조향각 (rad). 뒤차축 (x, y)에서 ff_lookahead_s(최소 ff_lookahead_min_m) 앞 곡률 κ_la로 계산합니다.
+        mode 1: atan(L x κ_la) 전체 (축거 L = 3.0 m)
+        mode 0(기본): atan(L x κ_la) - atan(L x κ_now). 앞바퀴 축 기준 Stanley의 방향 오차 항이 정상 상태 곡률(atan(L x κ))을 이미
+                      반영하므로, 전체를 더하면 코너에서 이중으로 꺾음. 곡률이 바뀌는 만큼(코너 진입·변곡·탈출)만 미리 반영."""
+        k = self.curvature()
+        if len(k) < 2:
+            return 0.0
+        i = self.nearest_index(x, y)
+        look = max(self.ff_lookahead_min_m, abs(self.speed) * self.ff_lookahead_s)
+        j = min(len(k) - 1, bisect.bisect_left(self._s, self._s[i] + look))
+        ff = math.atan(WHEELBASE * k[j])
+        if self.curv_ff_mode < 0.5:
+            ff -= math.atan(WHEELBASE * k[i])
+        return ff
+
     def nearest_index(self, x, y):
         return min(range(len(self.path)), key=lambda i: math.hypot(self.path[i][0] - x, self.path[i][1] - y))
 
     def curvature(self):
-        """경로 점마다의 부호 있는 곡률 (1/m, + 왼쪽). 앞뒤 curv_window_m의 방향 변화로 구해 노이즈에 강합니다."""
+        """경로 점마다의 곡률을 구해 캐시합니다. 반환: 부호 있는 곡률 목록 (1/m, + 왼쪽).
+        - 세 점 외접원(Menger): 앞뒤 menger_step점 간격의 세 점 A, B, C로 κ = 2 (AB x BC) / (|AB| |BC| |AC|)
+        - curv_smooth점 이동평균으로 스무딩해 노이즈로 곡률이 튀지 않게 함
+        - 유효 곡률 self._k_eff[i] = 지금 점부터 전방 curv_lookahead_m 안의 최대 |κ| (속도 한계 계산용)
+        - 저마찰·경사·장애물 구역 표시와 구역 앞 구간(lead) 표시도 같이 만듭니다."""
         path = self.path
         if self._curv_src is path:
             return self._curv
         n = len(path)
-        s = [0.0]
-        for a, b in zip(path, path[1:]):
-            s.append(s[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
-        k = [0.0] * n
-        j0 = j1 = 0
-        for i in range(n):
-            while j0 < i and s[i] - s[j0] > self.curv_window_m:
-                j0 += 1
-            while j1 < n - 1 and s[j1 + 1] - s[i] <= self.curv_window_m:
-                j1 += 1
-            if s[j1] - s[j0] > 1e-6:
-                k[i] = angle_diff(path[j1][2], path[j0][2]) / (s[j1] - s[j0])
-        self._curv_src, self._curv, self._s = path, k, s
+        pts = np.asarray([(p[0], p[1]) for p in path], dtype=float).reshape(-1, 2)
+        s = np.zeros(n)
+        if n > 1:
+            s[1:] = np.cumsum(np.hypot(*np.diff(pts, axis=0).T))
+        k = np.zeros(n)
+        m = max(1, int(self.menger_step))
+        if n > 2 * m:
+            ab, bc, ac = pts[m:-m] - pts[:-2 * m], pts[2 * m:] - pts[m:-m], pts[2 * m:] - pts[:-2 * m]
+            cross = ab[:, 0] * bc[:, 1] - ab[:, 1] * bc[:, 0]
+            den = np.hypot(*ab.T) * np.hypot(*bc.T) * np.hypot(*ac.T)
+            k[m:n - m] = 2.0 * cross / np.maximum(den, 1e-9)
+            k[:m], k[n - m:] = k[m], k[n - m - 1]
+        w = max(1, int(self.curv_smooth)) | 1                       # 홀수 창
+        if w > 1 and n > 1:
+            k = np.convolve(np.pad(k, (w // 2, w // 2), mode='edge'), np.ones(w) / w, mode='valid')
+        ak = np.abs(k)
+        j_end = np.searchsorted(s, s + self.curv_lookahead_m, side='right')
+        k_eff = np.array([ak[i:max(int(j_end[i]), i + 1)].max() for i in range(n)]) if n else ak
+        sl = s.tolist()
+        self._curv_src, self._curv, self._k_eff, self._s = path, k.tolist(), k_eff.tolist(), sl
         self._low = [self.in_zone('low_friction', p[0], p[1]) for p in path]
         self._slope = [self.in_zone('slope', p[0], p[1]) for p in path]
+        self._slope_curve = [self.in_zone('slope_curve', p[0], p[1]) for p in path]
         obst = [self.in_zone('obstacle1', p[0], p[1]) or self.in_zone('obstacle3', p[0], p[1]) for p in path]
-        self._obst, nxt = [False] * n, None         # 장애물 구역 입구 obstacle_lead_m 앞부터 구역 끝까지
-        for i in range(n - 1, -1, -1):
-            if obst[i]:
+        self._obst = self._lead(obst, sl, self.obstacle_lead_m)      # 장애물 구역 입구 obstacle_lead_m 앞부터 구역 끝까지
+        self._low_lat = self._lead(self._low, sl, self.lowmu_lat_lead_m)   # 저마찰 횡가속도 한계: 구역 + 앞 lowmu_lat_lead_m
+        self._low_dec = self._lead(self._low, sl, self.lowmu_dec_lead_m)   # 저마찰 감속 계획: 구역 + 앞 lowmu_dec_lead_m
+        if any(self._low_lat):                       # 저마찰 구역은 전방 탐색 거리를 짧게: 정점을 빠져나오면 바로 직선으로 인식
+            j_low = np.searchsorted(s, s + self.curv_lookahead_lowmu_m, side='right')
+            for i in range(n):
+                if self._low_lat[i]:
+                    k_eff[i] = ak[i:max(int(j_low[i]), i + 1)].max()
+            self._k_eff = k_eff.tolist()
+        return self._curv
+
+    @staticmethod
+    def _lead(flags, s, lead):
+        """flags가 True인 점과, 그 점들 앞(경로 방향으로 거꾸로) lead m 안의 점도 True."""
+        out, nxt = [False] * len(flags), None
+        for i in range(len(flags) - 1, -1, -1):
+            if flags[i]:
                 nxt = s[i]
-            self._obst[i] = nxt is not None and nxt - s[i] <= self.obstacle_lead_m
-        plan, nxt = [False] * n, None               # 계획용: 저마찰 구역 앞 lowmu_lead_m 구간도 저마찰로 봄
-        for i in range(n - 1, -1, -1):
-            if self._low[i]:
-                nxt = s[i]
-            plan[i] = nxt is not None and nxt - s[i] <= self.lowmu_lead_m
-        self._low_plan = plan
-        return k
+            out[i] = nxt is not None and nxt - s[i] <= lead
+        return out
 
     def brake_feedforward(self):
         """앞으로 brake_ff_lookahead_s 동안 프로파일이 요구하는 감속을 brake(0~1)로 바꾼 앞먹임. 줄일 필요가 없으면 0."""
@@ -369,31 +436,44 @@ class Control(Node):
         return clamp(a_req / self.brake_ff_decel, 0.0, 1.0)
 
     def speed_target(self):
-        """목표 속력 (m/s). 곡률 한계 속도에 코너 앞 감속(뒤에서 앞으로 전파)을 더한 프로파일에서 지금 위치의 값."""
+        """목표 속력 (m/s). 곡률 한계 속도에 감속(뒤에서 앞으로)·가속(앞에서 뒤로) 제한을 더한 프로파일에서 지금 위치의 값.
+        v_lat(i) = clip(sqrt(a_lat / max(κ_eff(i), 1e-4)), v_min, v_max): 일반 노면 a_lat_normal, 저마찰 a_lat_lowmu.
+        Backward pass: v(i) <= sqrt(v(i+1)^2 + 2 a_dec ds) (일반 a_decel, 저마찰·진입 전 15 m는 a_decel_lowmu)
+        Forward pass: 저마찰 구역 안에서만 v(i+1) <= sqrt(v(i)^2 + 2 a_acc ds), a_acc = a_acc_lowmu (휠스핀 방지)."""
         if not self.profile_enabled:
             return self.target_speed
-        k = self.curvature()
-        s = self._s
-        n = len(k)
-        low, slope = self._low_plan, self._slope
+        self.curvature()
+        k_eff, s = self._k_eff, self._s
+        n = len(k_eff)
         v = []
-        for i, c in enumerate(k):                    # 점마다 한계: 저마찰이면 더 보수적, 경사면 최고 속도 제한
-            if low[i]:
+        for i in range(n):                           # 점마다 횡방향 한계 속도: 저마찰이면 더 보수적, 경사면 최고 속도 제한
+            if self._low_lat[i]:
                 a_lat, lo, hi = self.a_lat_lowmu, self.v_min_lowmu, min(self.v_max, self.v_max_lowmu)
             else:
-                a_lat, lo, hi = self.a_lat_max, self.v_min, min(self.v_max, self.v_max_slope) if slope[i] else self.v_max
+                a_lat, lo, hi = self.a_lat_normal, self.v_min, min(self.v_max, self.v_max_slope) if self._slope[i] else self.v_max
+                if self._slope_curve[i]:                 # 경사 구역 주변 S자: 코너를 더 여유 있게 (R=6 m -> 약 3.5 m/s)
+                    a_lat, lo = self.a_lat_slope, min(self.v_min_slope, hi)
             if self._obst[i]:                        # 장애물 구간: 어디서 장애물이 나와도 대응할 수 있게 미리 속도를 낮춤
                 hi = min(hi, self.v_max_obstacle)
                 lo = min(lo, hi)                     # v_min(4.5)이 구간 최고 속도보다 크면 구간 속도가 무시되므로 같이 낮춤
-            vi = clamp(math.sqrt(a_lat / max(abs(c), 1e-6)), lo, hi)
+            vi = clamp(math.sqrt(a_lat / max(k_eff[i], 1e-4)), lo, hi)
             if len(self.path_vlim) == n and self.path_vlim[i] > 0.0:   # 미션이 붙인 속도 한계는 v_min보다도 우선
                 vi = min(vi, self.path_vlim[i])
             v.append(vi)
-        for i in range(n - 2, -1, -1):               # 앞쪽 점의 속도에서 감속으로 줄일 수 있는 속도까지만 허용
-            a_dec = self.a_decel_lowmu if low[i] else self.a_decel
+        for i in range(n - 2, -1, -1):               # Backward pass: 앞쪽 점의 속도에서 감속으로 줄일 수 있는 속도까지만 허용
+            a_dec = self.a_decel_lowmu if self._low_dec[i] else self.a_decel
             v[i] = min(v[i], math.sqrt(v[i + 1] ** 2 + 2.0 * a_dec * (s[i + 1] - s[i])))
-        self._prof = v
         i = self.nearest_index(self.x, self.y)
+        if any(self._low[i:]):                       # Forward pass: 지금 속도에서 출발해 저마찰 구역 안의 가속을 제한
+            f = max(abs(self.speed), 1.0)
+            for j in range(i, n - 1):
+                a_acc = self.a_acc_lowmu if self._low[j] else 1e3
+                f = math.sqrt(f * f + 2.0 * a_acc * (s[j + 1] - s[j]))
+                if f < v[j + 1]:
+                    v[j + 1] = f
+                else:
+                    f = v[j + 1]
+        self._prof = v
         last = min(n - 1, i + 1 + int(self.speed * self.speed_lead_s / 0.5))
         return min(v[i:last + 1])
 
@@ -406,6 +486,15 @@ class Control(Node):
         c.long_cmd_type = CtrlCmd.LONG_CMD_THROTTLE
         c.accel, c.brake, c.steering = float(accel), float(brake), float(steer)
         self.cmd_pub.publish(c)
+
+
+def soft_deadzone(e, width):
+    """|e| <= width 이면 0, 그 바깥은 width만큼 줄여서 연속으로 이음."""
+    if e > width:
+        return e - width
+    if e < -width:
+        return e + width
+    return 0.0
 
 
 def point_in_polygon(poly, x, y):
