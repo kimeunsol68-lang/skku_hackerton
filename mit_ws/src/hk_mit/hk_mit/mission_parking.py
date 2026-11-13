@@ -559,6 +559,7 @@ RPARAMS = {                              # 후면 주차 (T자 통로) 값
     'rpark_r1': 4.6,                     # 진입 왼쪽 회전 반지름
     'rpark_r2': 4.6,                     # 안쪽에서 오른쪽(남쪽) 회전 반지름
     'rpark_gin': 0.5,                    # 통로 안에서 중심선보다 북쪽으로 붙는 양 (m)
+    'rpark_turn_early': 0.4,             # 진입 두 번째 회전을 슬롯 중심보다 이만큼(m) 서쪽에서 끝냄 (동쪽 벽 여유)
     'rpark_v_enter': 3.0,                # 진입: 호(회전) 구간 속력
     'rpark_v_enter_fast': 5.0,           # 진입: 직선 구간 최고 속력 (호 앞에서 미리 감속)
     'rpark_v_exit': 3.0,                 # 탈출: 호 구간 속력
@@ -718,7 +719,7 @@ class RearParking(Parking):
         g = self.g if self.g is not None else p['rpark_gate_y']
         R1, R2, xl = p['rpark_r1'], p['rpark_r2'], p['rpark_lane_x']
         yt = g + p['rpark_gin'] + R1                         # 왼쪽 회전을 시작할 y
-        xb = p['rpark_slot_x'] - R2
+        xb = p['rpark_slot_x'] - R2 - p['rpark_turn_early']   # 0.4 m 일찍 남쪽으로 회전: GNSS 오차(동쪽 0.3 m)로 앞 모서리가 동쪽 벽에 닿던 문제
         sx = max(0.0, xb - (xl + R1))
         lead = max(0.5, y_now - yt)
         prims = [('S', lead), ('A', math.pi / 2, R1), ('S', sx), ('A', -math.pi / 2, R2), ('S', 0.5)]
@@ -858,7 +859,9 @@ class RearParking(Parking):
                 self.log(f'rear: 통로 y={self.g if self.g is not None else p["rpark_gate_y"]:.2f} 슬롯 c={self.slot_c():.2f}')
                 self._set('ENTER', now)
                 return 0.0, 0.0, 0.0, D
-            acc, brk = self._speed(2.5, v, dt)
+            # keep the entry-straight speed while the gate is being found (usually < 0.5 s); 2.5 m/s here made the car
+            # brake hard right after cp9 and accelerate again. The commit-point stop above still guards a missing gate.
+            acc, brk = self._speed(p['rpark_v_enter_fast'], v, dt)
             steer = self._stanley(path, x, y, yaw, speed) if path else 0.0
             return acc, brk, steer, D
         if st == 'ENTER':
@@ -882,7 +885,7 @@ class RearParking(Parking):
                 self._set('SHIFT_R', now)
             return 0.0, 1.0, 0.0, D
         if st == 'SHIFT_R':
-            if now - self.t_state > 0.4:
+            if now - self.t_state > SHIFT_WAIT_S:
                 self._set('REVERSE', now)
             return 0.0, 1.0, 0.0, R
         if st == 'REVERSE':
@@ -896,7 +899,7 @@ class RearParking(Parking):
             if left <= self.rev_tol:
                 self._set('STOP_REV', now)
                 return 0.0, 1.0, 0.0, R
-            v_t = max(0.5, min(p['rpark_v_reverse'], 0.5 + 1.1 * left))      # 끝에 가까울수록 부드럽게 감속
+            v_t = max(0.4, min(p['rpark_v_reverse'], 0.4 + 1.6 * left))      # 끝에 가까울수록 감속 (1.1 -> 1.6: 후진 시간 단축)
             acc, brk = self._speed(v_t, v, dt)
             return acc, brk, steer, R
         if st == 'STOP_REV':
@@ -936,7 +939,7 @@ class RearParking(Parking):
                         self._set('REDO_SHIFT', now)
             return 0.0, 1.0, 0.0, R
         if st == 'REDO_SHIFT':
-            if now - self.t_state > 0.4:
+            if now - self.t_state > SHIFT_WAIT_S:
                 self._set('REDO', now)
             return 0.0, 1.0, 0.0, D
         if st == 'REDO':
@@ -948,13 +951,13 @@ class RearParking(Parking):
             return acc, brk, steer, D
         if st == 'HOLD':
             if self.t_hold0 is None:
-                self.t_hold0 = now
+                self.t_hold0 = self.stopped_since if self.stopped_since is not None else now
             if now - self.t_hold0 >= p['park_hold_s']:
                 self.path = self._exit_path(x, y)
                 self._set('EXIT_SHIFT_D', now)
             return 0.0, 1.0, 0.0, R
         if st == 'EXIT_SHIFT_D':
-            if now - self.t_state > 0.4:
+            if now - self.t_state > SHIFT_WAIT_S:
                 self._set('EXIT_FWD', now)
             return 0.0, 1.0, 0.0, D
         if st == 'EXIT_FWD':
@@ -994,6 +997,10 @@ class ParkingMission(MissionBase):
         name = 'parallel_parking' if inp.cp.section == ('cp8','cp9') else 'rear_parking'
         if not option_on(options, name):
             return MissionOutput(is_done=True)
+        from .course import fast_mode
+        if fast_mode(options) and not getattr(self.ppark, 'fast_applied', False):
+            self.ppark.p.update(park_decel=2.5)          # 공격 모드: 평행주차 접근 감속 1.8 -> 2.5
+            self.ppark.fast_applied = True
         if inp.cp.section == ('cp8', 'cp9'):
             return self.parallel_parking(inp)
         return self.rear_parking(inp)
@@ -1006,8 +1013,10 @@ class ParkingMission(MissionBase):
             start = getattr(pk, 'settle_from', None)
             if start is None:
                 start = pk.settle_from = (inp.x, inp.y)
-            if inp.local_path and math.hypot(inp.x - start[0], inp.y - start[1]) < EXIT_SETTLE_M:
-                return MissionOutput(override_path=[(p[0], p[1], p[2], EXIT_SETTLE_SPEED) for p in inp.local_path])
+            from .course import fast_mode
+            settle_m, settle_v = (3.0, 4.0) if fast_mode(getattr(self, 'options', None) or load_options()) else (EXIT_SETTLE_M, EXIT_SETTLE_SPEED)
+            if inp.local_path and math.hypot(inp.x - start[0], inp.y - start[1]) < settle_m:
+                return MissionOutput(override_path=[(p[0], p[1], p[2], settle_v) for p in inp.local_path])
             return MissionOutput(is_done=True)
         accel, brake, steer, gear = pk.update(inp.x, inp.y, inp.yaw, inp.speed, inp.scan, inp.local_path, inp.t, inp.scan_pose)
         return MissionOutput(override_cmd=(accel, brake, steer, 'R' if gear == GEAR_REVERSE else 'D'))
