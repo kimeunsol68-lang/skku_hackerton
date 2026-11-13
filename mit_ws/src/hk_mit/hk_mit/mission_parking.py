@@ -82,6 +82,8 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+SHIFT_WAIT_S = 0.25         # 기어 전환 대기 (0.4 -> 0.25 s; 구동 지연 기준 75 ms)
+STOP_CHECK_S = 0.25         # 정지 확인 (속도 < 0.03 m/s 유지 시간, 0.4 -> 0.25 s). 3초 유지는 실제 정지 시점부터 셈
 SLOT_X_TRUE = -18.1147      # course.json 평행주차 칸 중심 x
 
 
@@ -278,7 +280,7 @@ class Parking:
         self.int = 0.0
         self.stopped_since = None
 
-    def _stopped(self, v_mag, now, hold=0.4):
+    def _stopped(self, v_mag, now, hold=STOP_CHECK_S):
         if v_mag < 0.03:
             if self.stopped_since is None:
                 self.stopped_since = now
@@ -420,7 +422,7 @@ class Parking:
             return 0.0, 1.0, 0.0, GEAR_DRIVE
         if st == 'SHIFT_R':
             steer, _ = self._pursuit(self.path, a, b, psi, True)
-            if now - self.t_state > 0.4:
+            if now - self.t_state > SHIFT_WAIT_S:
                 self._set('REVERSE', now)
             return 0.0, 1.0, steer, GEAR_REVERSE
         if st == 'REVERSE':
@@ -443,7 +445,7 @@ class Parking:
                 self._after_stop(a, b, psi, now)
             return 0.0, 1.0, 0.0, GEAR_REVERSE
         if st in ('ADJUST_SHIFT',):
-            if now - self.t_state > 0.4:
+            if now - self.t_state > SHIFT_WAIT_S:
                 self._set('ADJUST', now)
             return 0.0, 1.0, 0.0, GEAR_REVERSE if self.dir < 0 else GEAR_DRIVE
         if st == 'ADJUST':
@@ -475,7 +477,7 @@ class Parking:
                     self._set('EXIT_SHIFT_D', now)
             return 0.0, 1.0, 0.0, GEAR_REVERSE if self.dir < 0 else GEAR_DRIVE
         if st == 'EXIT_SHIFT_R':
-            if now - self.t_state > 0.4:
+            if now - self.t_state > SHIFT_WAIT_S:
                 self._set('EXIT_BACK', now)
             return 0.0, 1.0, 0.0, GEAR_REVERSE
         if st == 'EXIT_BACK':
@@ -490,7 +492,7 @@ class Parking:
                 self._set('EXIT_SHIFT_D', now)
             return 0.0, 1.0, 0.0, GEAR_REVERSE
         if st == 'EXIT_SHIFT_D':
-            if now - self.t_state > 0.4:
+            if now - self.t_state > SHIFT_WAIT_S:
                 self._set('EXIT_FWD', now)
             return 0.0, 1.0, 1.0, GEAR_DRIVE
         if st == 'EXIT_FWD':

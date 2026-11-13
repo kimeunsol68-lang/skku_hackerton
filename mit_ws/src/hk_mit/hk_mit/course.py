@@ -42,6 +42,12 @@ def option_on(options, name):
     return options is not None and bool(options.get(name, False))
 
 
+def fast_mode(options):
+    """2차 시도용 공격 모드: 구성에서 LiDAR 노이즈(20점, 세트 보너스 없음)만 끈 경우.
+    1차(모든 옵션)는 안전 모드 그대로, 2차는 이 구성으로 더 빠르게 달려 최고점을 노립니다."""
+    return options is not None and option_on(options, 'parallel_parking') and not bool(options.get('lidar_noise', True))
+
+
 def declare_file_params(node):
     """노드에 route_csv, course_json 파라미터를 만듭니다 (비우면 패키지의 course/ 파일)."""
     node.declare_parameter('route_csv', '')

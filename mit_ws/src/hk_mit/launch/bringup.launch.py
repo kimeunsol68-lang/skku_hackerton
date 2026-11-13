@@ -73,7 +73,7 @@ def generate_launch_description():
         Node(package=PKG, executable='localization', output='screen', parameters=[cfg, sim_time, files]),
         Node(package=PKG, executable='planner', output='screen', parameters=[cfg, sim_time, files]),
         Node(package=PKG, executable='control', output='screen',
-             parameters=[cfg, sim_time, {'target_speed': arg('target_speed')}]),
+             parameters=[cfg, sim_time, files, {'target_speed': arg('target_speed')}]),
         Node(package=PKG, executable='lidar_perception', output='screen', condition=perception, parameters=[sim_time]),
         Node(package='robot_state_publisher', executable='robot_state_publisher', name='hk_mit_robot_state_publisher',
              output='screen', condition=IfCondition(arg('sensor_tf')),

@@ -114,6 +114,8 @@ class Planner(Node):
             self.missions = self.load_missions() if self.missions_enabled else None
             if self.missions_enabled and self.missions is None:
                 raise ValueError('미션 초기화 실패')
+            if self.missions is not None:
+                self.missions.reset(getattr(self, 'checkpoint', 0))   # 재시도로 새로 만든 관리자도 복귀 체크포인트부터
             self.slow_zone = self.load_slow_zone()
             self.config_ready = True
             self.get_logger().info('주행 구성: ' + json.dumps({'source': self.runtime_config['_source'],

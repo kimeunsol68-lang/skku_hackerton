@@ -48,7 +48,7 @@ MAX_STEER = math.radians(35.4)
 # ---- 정지선 ------------------------------------------------------------------------------------
 STOP_NEAR = 3.0         # 앞 범퍼가 s_entry - 3.0 m에 닿으면 완전 정지. 시뮬레이터 NPC 모델로 잰 값: 1.5 m 앞이면 지나가는 NPC와 0.77 m,
                         # 0.3 m 앞이면 닿음. 정지 오차를 감안해 1 m 이상 여유(3.0 m 앞이면 2.27 m)를 둠
-A_DECEL = 2.0        # 접근 감속 곡선 (m/s^2): 정지선 10 m 전에 약 5.5 m/s
+A_DECEL = 2.5           # 접근 감속 곡선 (m/s^2). 2.0 -> 2.5: cp5 -> 정지선 42 m에 11 s가 걸려 단축
 V_FLOOR = 1.0           # 접근 속도 한계의 하한 (m/s). 이 속도로 정지 구간까지 들어간 뒤 브레이크
 STOPPED_SPEED = 0.3     # 이보다 느리면 멈춘 것으로 봄 (m/s)
 APPROACH_VIEW_M = 60.0  # 정지선까지 이만큼 이내가 되면 접근 속도 한계를 내보냄 (m). cp5 직후부터 적용
@@ -236,7 +236,7 @@ class RotaryMission(MissionBase):
                 speeds.append((u0 - u1) / (t1 - t0))
         v = float(np.median(speeds)) if len(speeds) >= 2 else V_NPC_DEFAULT
         v = min(max(v, 2.0), 8.0)
-        u_safe = min(max(v * T_CLEAR, U_SAFE_MIN), U_SAFE_MAX)
+        u_safe = min(max(v * getattr(self, 't_clear', T_CLEAR), U_SAFE_MIN), U_SAFE_MAX)
         out['v'], out['u_safe'] = v, u_safe
         if len(speeds) >= 2:
             self.npc_v = v                                                 # 원 안에서 앞 NPC를 따라갈 속도
@@ -283,7 +283,13 @@ class RotaryMission(MissionBase):
     def update(self, inp: MissionInput) -> MissionOutput:
         if self.enabled is None:                        # 옵션이 꺼져 있으면 NPC가 없으니 정지·대기하지 않음
             from .course import load_options, option_on
-            self.enabled = option_on(getattr(self, 'options', None) or load_options(), 'roundabout')
+            opts = getattr(self, 'options', None) or load_options()
+            self.enabled = option_on(opts, 'roundabout')
+            from .course import fast_mode
+            # 공격 모드(2차 시도): 합류 여유를 줄이고 출구·접근·원 안 속도를 올림
+            self.rolling = fast_mode(opts)      # 무정지 합류는 공격 모드(2차)에서만: 안전 모드에서 NPC 충돌 기록(seed 0)
+            self.t_clear, self.exit_speed, self.approach_vmax, self.go_speed = \
+                (3.4, 6.5, 10.0, 6.3) if fast_mode(opts) else (T_CLEAR, EXIT_SPEED, APPROACH_VMAX, GO_SPEED)
             if self.log and not self.enabled:
                 self.log.info('로터리 옵션이 꺼져 있어 로터리 미션을 건너뜁니다')
         if not self.enabled:
@@ -305,7 +311,7 @@ class RotaryMission(MissionBase):
         if not inp.local_path:
             return MissionOutput()
         if s_ego > g['s_exit'] + 2.0:                                   # 원은 빠져나감: 출구 R=15 커브는 EXIT_SPEED로
-            return MissionOutput(override_path=self._with_limits(inp.local_path, lambda s_p: EXIT_SPEED))
+            return MissionOutput(override_path=self._with_limits(inp.local_path, lambda s_p: self.exit_speed))
 
         xy = self._lidar_points(inp)
         stamp = None if inp.scan is None else (inp.scan.header.stamp.sec, inp.scan.header.stamp.nanosec)
@@ -351,7 +357,10 @@ class RotaryMission(MissionBase):
                 self.wait_since = None
                 self.clear_frames = 0
             dist = stop_rear - s_ego
-            if ROLLING_ENTRY and not at_line and new_frame and 0.0 < dist <= ROLL_DECIDE_M and inp.speed > 1.0:
+            in_window = ROLLING_ENTRY and getattr(self, 'rolling', False) and not at_line and 0.0 < dist <= ROLL_DECIDE_M and inp.speed > 1.0
+            if in_window and not new_frame:
+                pass                                                     # 20 Hz 중 새 스캔 없는 주기: 카운터 유지 (예전엔 0으로 지워 무정지 합류가 불가능했음)
+            elif in_window:
                 t_arr = dist / max(inp.speed, 1.0) + ROLL_LATENCY_S      # 정지 위치 도착까지 걸릴 시간
                 n_danger = self._assess_rolling(xy, t_arr)
                 self.roll_clear = 0 if n_danger >= MIN_DANGER_POINTS else self.roll_clear + 1
@@ -364,7 +373,7 @@ class RotaryMission(MissionBase):
                 self.roll_clear = 0
 
         # 접근 속도 한계: 정지 위치까지 남은 거리에서 A_DECEL로 멈출 수 있는 속도 (V_FLOOR 이상)
-        path = self._with_limits(inp.local_path, lambda s_p: min(APPROACH_VMAX, max(math.sqrt(2.0 * A_DECEL * max(stop_rear - s_p, 0.0)), V_FLOOR)))
+        path = self._with_limits(inp.local_path, lambda s_p: min(self.approach_vmax, max(math.sqrt(2.0 * A_DECEL * max(stop_rear - s_p, 0.0)), V_FLOOR)))
         cmd = (0.0, 1.0, self._steer(inp), 'D') if at_line else None
         if cmd is not None and not self.logged_stop and self.log:
             self.log.info(f'로터리 정지선 도착 (앞 범퍼 s={s_front:.1f}, 정지 기준 {stop_front:.1f}): 정지하고 대기')
@@ -374,7 +383,7 @@ class RotaryMission(MissionBase):
     # ---- 진입 후 ------------------------------------------------------------------------------------
     def _inside(self, inp, xy, s_front):
         """원을 따라 빠르게 빠져나감. 앞 6.5 m 경로 위에 점이 있으면 느리게."""
-        v = GO_SPEED
+        v = self.go_speed
         if len(xy):
             ego_i = inp.cp.index if inp.cp is not None else 0
             gi, s_p, d_p = self._frenet(xy, max(0, ego_i - SEARCH_BEHIND), min(len(self.pts), ego_i + SEARCH_AHEAD))

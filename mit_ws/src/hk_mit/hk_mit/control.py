@@ -53,13 +53,22 @@ from nav_msgs.msg import Odometry, Path
 from hk_interfaces.msg import CtrlCmd
 from std_msgs.msg import String
 
-from .course import COURSE_DIR, load_runtime_config, option_on
+from .course import fast_mode, COURSE_DIR, load_runtime_config, option_on
 from .sensing import fresh, stamp, predict_motion
 from .sim_events import SimEvents
 
 # 조정할 값은 config/bringup.yaml의 파라미터입니다(공식 주행 직전에는 코드가 아니라 이 파일만 바꿀 수 있음).
 # 아래는 yaml에 값이 없을 때 쓰는 기본값입니다.
 TARGET_SPEED_DEFAULT = 5.0
+# 공격 모드 값 (2차 시도 전용). 안전 모드 값은 bringup.yaml (a_lat_max 3.0, a_lat_lowmu 1.3 ...)
+FAST_PARAMS = {
+    'a_lat_max': 3.5,       # 마른 노면 커브 (안전 3.0)
+    'a_decel': 3.0,         # 커브 앞 감속 계획
+    'a_lat_lowmu': 1.55,    # 저마찰 커브 (안전 1.3, mu=0.2 한계 1.96)
+    'a_lat_slope': 3.3,     # 경사 헤어핀 (안전 3.0)
+    'v_max_obstacle': 6.0,  # 장애물 구간 (안전 5.0)
+}
+
 PARAMS = {
     'target_speed': TARGET_SPEED_DEFAULT,   # 목표 속력 (m/s). 실행할 때 target_speed:=… 로도 바꿀 수 있습니다.
     'k_stanley': 1.0,      # 경로에서 옆으로 벗어난 거리에 대한 조향 세기
@@ -185,6 +194,14 @@ class Control(Node):
             if self.auto_latency:
                 self.steer_delay_comp = float(c.get('steer_latency_ms', 250)) / 1000.0 if option_on(options, 'steer_latency') else 0.0
                 self.speed_lead_s = (float(c.get('drive_latency_ms', 75)) / 1000.0 if option_on(options, 'drive_latency') else 0.0) + 0.04
+            # 공격 모드(2차 시도): LiDAR 노이즈만 끈 구성에서 커브·저마찰·경사·장애물 속도 한계를 올림
+            if not hasattr(self, '_safe_params'):
+                self._safe_params = {k: getattr(self, k) for k in FAST_PARAMS}
+            fast = fast_mode(options)
+            for k, v in (FAST_PARAMS if fast else self._safe_params).items():
+                setattr(self, k, v)
+            if fast:
+                self.get_logger().warn(f'공격 모드 (LiDAR 노이즈 꺼짐): {FAST_PARAMS}')
             self.zones = self.load_zones()
             self._curv_src = None
             self.config_ready = True
@@ -430,7 +447,12 @@ class Control(Node):
     def speed_target(self):
         """목표 속력 (m/s). 곡률 한계 속도에 코너 앞 감속(뒤에서 앞으로 전파)을 더한 프로파일에서 지금 위치의 값."""
         if not self.profile_enabled:
+            # keep mission speed limits (roundabout stop line, parking settle) even without the profile
             self.target_reason = 'constant_speed'
+            lims = [v for v in self.path_vlim if v > 0.0] if self.path is not None else []
+            if lims and min(lims) < self.target_speed:
+                self.target_reason = 'mission_path'
+                return min(lims)
             return self.target_speed
         k = self.curvature()
         s = self._s
@@ -460,12 +482,15 @@ class Control(Node):
             reasons.append(reason)
         if self.corner_hold_m > 0.0:                 # 급커브 직전에는 가속하지 않음: 짧은 직선에서 올린 속도를 급조향 중 제동으로 못 줄여 이탈함
             hold = list(v)
+            # only curvature limits count as corners: a mission stop-line limit (roundabout V_FLOOR 1 m/s) held the
+            # car at 1.6 m/s for the last 8 m before the stop line (~5 s per lap)
+            vc = [vi if r not in ('mission_path',) else math.inf for vi, r in zip(v, reasons)]
             j = 0
             for i in range(n):
                 j = max(j, i)
                 while j + 1 < n and s[j + 1] - s[i] <= self.corner_hold_m:
                     j += 1
-                m = min(v[i:j + 1])
+                m = min(vc[i:j + 1])
                 if m < self.corner_hold_vmax and m + self.corner_hold_margin < hold[i]:
                     hold[i] = m + self.corner_hold_margin
                     reasons[i] = 'corner_hold'

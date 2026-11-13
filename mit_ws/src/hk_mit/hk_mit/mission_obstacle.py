@@ -67,6 +67,9 @@ NEXT_RANGE = 12.0       # A 뒷끝에서 B 앞끝까지가 이만큼(m) 이내�
 RETURN_M = 10.0         # return gently enough to keep the front corners inside the road
 RAMP_MIN = 4.2          # 코사인 전환 최소 길이 (m)
 KAPPA_LIM = 0.10        # about 10 m lane-change ramps, checked against the whole body
+SCAN_LOSS_S = 1.0       # 이보다 오래 LiDAR가 없으면 장애물 구간을 저속으로
+SCAN_LOSS_SPEED = 1.5
+FAST_SPEED_LIMIT = 6.0  # 공격 모드(2차 시도, LiDAR 노이즈 꺼짐)
 SPEED_LIMIT = 5.0       # maneuver only (0.10 1/m ramps -> 2.5 m/s^2 lateral at 5 m/s; control also caps by curvature)
 PATH_BEHIND, PATH_AHEAD, PATH_STEP = 2.0, 18.0, 0.5   # override_path 범위 (뒤차축 기준 m)
 SEARCH_BEHIND, SEARCH_AHEAD = 12, 100   # 전역 경로에서 찾는 범위 (점 번호, 0.5 m 간격)
@@ -355,6 +358,11 @@ class ObstacleMission(MissionBase):
         rel = np.array([inp.x, inp.y]) - self.pts[ego_i]
         s_ego = float(self.s[ego_i] + rel @ self.tan[ego_i])
 
+        if inp.scan is not None:
+            self.last_scan_t = inp.t
+        elif inp.t - getattr(self, 'last_scan_t', inp.t) > SCAN_LOSS_S and inp.local_path:
+            # LiDAR gone for a long time (not a single dropped frame): creep instead of driving blind into the zone
+            return MissionOutput(override_path=[(p[0], p[1], p[2], SCAN_LOSS_SPEED) for p in inp.local_path])
         if inp.scan is not None and stamp(inp.scan) != self.last_scan_stamp:
             self.last_scan_stamp = stamp(inp.scan)
             self._track(self._detect(inp, ego_i, s_ego), s_ego, stamp(inp.scan))
@@ -446,6 +454,8 @@ class ObstacleMission(MissionBase):
                 self.last_warning = inp.t
             return MissionOutput(override_cmd=(0.0, 1.0, 0.0, 'D'))
         end_maneuver = max(tr.hi() + RETURN_M for tr in elems)
-        path = [(float(x), float(y), float(h), SPEED_LIMIT if s <= end_maneuver else 0.0)
+        from .course import fast_mode
+        limit = FAST_SPEED_LIMIT if fast_mode(options) else SPEED_LIMIT
+        path = [(float(x), float(y), float(h), limit if s <= end_maneuver else 0.0)
                 for (x, y), h, s in zip(new, yaw, s_grid)]
         return MissionOutput(override_path=path)

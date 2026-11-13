@@ -39,6 +39,7 @@ WHEELBASE = 3.0        # 축간 거리 (m)
 MAX_STEER = math.radians(35.4)   # steer = 1 일 때 앞바퀴 각도
 RATE_HZ = 50.0
 SETTLE_S = 0.5         # 시작·복귀 뒤 이 시간 동안은 제동만 (시뮬레이터도 복귀 뒤 0.5초 명령을 무시함)
+INPUT_TIMEOUT_S = 0.5    # 위치(/hk/local/odom 50 Hz)·경로(/hk/plan/local_path 20 Hz)가 이보다 오래 안 오면 정지
 
 
 class Control(Node):
@@ -79,12 +80,14 @@ class Control(Node):
 
     def on_odom(self, m):
         self.odom = m
+        self.odom_t = self.now()
         p, q = m.pose.pose.position, m.pose.pose.orientation
         self.x, self.y = p.x, p.y
         self.yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
         self.speed = m.twist.twist.linear.x
 
     def on_path(self, m):
+        self.path_t = self.now()
         self.path = [(ps.pose.position.x, ps.pose.position.y,
                       2 * math.atan2(ps.pose.orientation.z, ps.pose.orientation.w)) for ps in m.poses]
 
@@ -97,6 +100,9 @@ class Control(Node):
             return
         if self.odom is None or self.path is None or self.now() - self.reset_time < SETTLE_S:
             self.send(0.0, 1.0, 0.0)                 # 시작·복귀 직후, 위치·경로가 아직 없으면 정지
+            return
+        if self.now() - getattr(self, 'odom_t', 0.0) > INPUT_TIMEOUT_S or self.now() - getattr(self, 'path_t', 0.0) > INPUT_TIMEOUT_S:
+            self.send(0.0, 1.0, 0.0)                 # localization·planner가 멈춤: 오래된 위치·경로로 달리지 않고 정지
             return
         self.send(*self.drive())
 
