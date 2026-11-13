@@ -93,7 +93,6 @@ class RotaryMission(MissionBase):
         super().__init__(logger)
 
     def reset(self):
-        self.enabled = None        # 이번 시도에서 로터리 옵션이 켜졌는가 (처음 update에서 읽음)
         self.entered = False       # 출발 결정을 내렸는가 (한 번 True가 되면 다시 멈추지 않음)
         self.clear_frames = 0
         self.last_stamp = None
@@ -248,13 +247,6 @@ class RotaryMission(MissionBase):
 
     # ---- 메인 ---------------------------------------------------------------------------------------
     def update(self, inp: MissionInput) -> MissionOutput:
-        if self.enabled is None:                        # 옵션이 꺼져 있으면 NPC가 없으니 정지·대기하지 않음
-            from .course import load_options, option_on
-            self.enabled = option_on(load_options(), 'roundabout')
-            if self.log and not self.enabled:
-                self.log.info('로터리 옵션이 꺼져 있어 로터리 미션을 건너뜁니다')
-        if not self.enabled:
-            return MissionOutput(is_done=True)
         if self.pts is None:
             self._load()
         if self.geo is None:

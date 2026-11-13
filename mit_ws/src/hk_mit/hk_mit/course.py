@@ -11,28 +11,6 @@ from pathlib import Path
 from ament_index_python.packages import get_package_share_directory
 
 COURSE_DIR = Path(get_package_share_directory('hk_mit')) / 'course'
-CURRENT_COURSE = Path('/data/current/course.json')   # 시뮬레이터가 시도마다 새로 쓰는 코스 파일 (컨테이너 안). 켜진 옵션이 들어 있음
-
-
-def load_options(path=None):
-    """이번 시도에서 켜진 옵션 {이름: bool} (예: 'low_friction', 'obstacle3', 'roundabout'). 읽을 수 없으면 None.
-    None이면 호출한 쪽은 모든 구역 대응을 켠 채로(가장 보수적으로) 동작합니다. 패키지에 들어 있는 기본 course.json에는
-    options가 없으므로(config 'none') 그 파일은 None으로 봅니다."""
-    for p in ([Path(path)] if path else []) + [CURRENT_COURSE]:
-        try:
-            with open(p, encoding='utf-8') as f:
-                d = json.load(f)
-        except (OSError, ValueError):
-            continue
-        opts = d.get('options')
-        if isinstance(opts, dict) and opts:
-            return {str(k): bool(v) for k, v in opts.items()}
-    return None
-
-
-def option_on(options, name):
-    """options가 None(모름)이면 True, 알면 그 옵션이 켜졌는지."""
-    return True if options is None else bool(options.get(name, False))
 
 
 def declare_file_params(node):
