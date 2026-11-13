@@ -21,6 +21,28 @@ hk_mit_control:
     brake_ff_lookahead_s: 0.8     # 앞먹임 제동이 내다보는 시간 (s)
     speed_lead_s: 0.25            # 구동·제동 지연 보상: 이 시간만큼 앞의 목표 속도를 씀 (s). 지연 옵션을 끄면 0.0~0.1
     target_speed: 5.0             # 프로파일을 끌 때(profile_enabled: 0)만 쓰는 목표 속력 (m/s)
+    # --- 저마찰 구간 (course.json의 low_friction zone 안에서만 적용) ---
+    lowmu_enabled: 1.0            # 1: 저마찰 구역 대응 켬, 0: 끔. 시뮬레이터 저마찰 옵션을 끄고 달릴 때는 0.0
+    a_lat_lowmu: 0.95             # 횡가속도 한계 (m/s²). μ=0.2 한계(약 1.96)의 절반 이하. R=7 m 코너 -> 약 2.6 m/s
+    v_min_lowmu: 2.3              # 이 구간의 최저 속도 (m/s)
+    v_max_lowmu: 5.0              # 이 구간의 최고 속도 (m/s)
+    a_decel_lowmu: 1.0            # 이 구간의 감속 계획 (m/s²). 작을수록 일찍 감속
+    accel_max_lowmu: 0.3          # 이 구간의 구동 상한 (0~1)
+    brake_max_lowmu: 0.35         # 이 구간의 제동 상한 (0~1). 바퀴 잠김 방지
+    steer_rate_lowmu: 6.0         # 이 구간의 조향 변화율 한계 (1/s). 사실상 제한 없음. 방향이 바뀔 때는 항상 즉시 추종
+    lowmu_lead_m: 12.0            # 저마찰 구역 앞 이만큼(m)부터 저마찰 속도 한계 적용 (구역 경계 오차 대비)
+    k_stanley_lowmu: 2.0          # 저마찰 구간 Stanley 옆오차 이득
+    k_soft_lowmu: 0.3             # 저마찰 구간 Stanley 저속 완화값 (m/s). 작을수록 저속에서 적극적
+    k_heading_lowmu: 1.0          # 저마찰 구간 방향 오차(전방 주시) 가중치
+    # --- 경사 구간 (course.json의 slope zone 안에서만 적용) ---
+    v_max_slope: 8.0              # 이 구간의 최고 속도 (m/s). 내리막 과속 방지
+    slope_ki_mult: 2.0            # 이 구간의 적분 이득 배수 (오르막 처짐·내리막 과속을 빨리 보정)
+    # --- 속력 PI 전환 / 조향 변화율 (구간 밖에서도) ---
+    brake_on: 0.10                # 구동 -> 제동 전환 문턱 (PI 출력이 -brake_on 아래일 때)
+    brake_off: 0.03               # 제동 -> 구동 복귀 문턱. brake_on보다 작게 둬야 경계에서 떨지 않음
+    steer_rate_max: 8.0           # 조향 변화율 한계 (1/s). 사실상 제한 없음. 방향이 바뀔 때는 항상 즉시 추종
+    # --- 좁은 도로 ---
+    track_point_m: 2.6            # Stanley가 맞추는 점 (뒤차축에서 앞으로 m). 3.0 = 앞바퀴 축
     # --- 지연 보상: 시뮬레이터의 지연 옵션과 맞추세요 ---
     steer_delay_comp: 0.25        # 조향 지연 보상 (s). 조향 지연 옵션 켬(250 ms) -> 0.25, 끔 -> 0.0
     # --- 조향 (Stanley) / 속력 (PI) ---
