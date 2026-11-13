@@ -17,6 +17,7 @@ MISSIONS = (ParkingMission, ObstacleMission, RotaryMission)
 SECTION_OPTIONS = {('start', 'cp1'): 'obstacle1', ('cp1', 'cp2'): 'obstacle1', ('cp6', 'cp7'): 'obstacle3',
                    ('cp8', 'cp9'): 'parallel_parking', ('cp9', 'cp10'): 'rear_parking',
                    ('cp5', 'cp6'): 'roundabout'}
+SCAN_REQUIRED_SECTIONS = {('cp5', 'cp6'), ('cp8', 'cp9'), ('cp9', 'cp10')}   # 로터리·주차: 스캔 없으면 정지
 ERROR_LOG_PERIOD_S = 1.0
 
 
@@ -58,7 +59,9 @@ class MissionManager:
         info = state.missions[0] if state.missions else {}
         if not enabled:
             return MissionOutput(), None, state
-        if scan is None:
+        if scan is None and sec in SCAN_REQUIRED_SECTIONS:
+            # Only the roundabout (NPC gap check) and the parking maneuvers must not move blind. In the obstacle
+            # sections a dropped/late scan made the car brake hard mid-road; there the mission keeps its tracks.
             return MissionOutput(override_cmd=(0.0, 1.0, 0.0, self.last_gear)), 'waiting_for_scan', state
         inp = None
         for m in self.missions:

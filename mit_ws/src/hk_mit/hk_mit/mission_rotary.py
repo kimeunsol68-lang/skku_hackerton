@@ -59,8 +59,8 @@ FIT_BAND = 0.8          # 원 맞춤에 쓰는 경로 점 밴드: R +- 0.8 m
 MERGE_BAND = 1.0        # 경로가 R + 이만큼 안으로 들어오면 원에 합류한 것으로 봄
 UPSTREAM_SCAN_M = 30.0  # NPC 속도를 재기 위해 진입선 상류 이 호 길이까지 봄 (m)
 DOWNSTREAM_M = 1.5      # 진입선 하류 이 호 길이 안의 NPC(아직 진입선을 막고 있는 앞차) = 위험
-T_CLEAR = 3.7           # 정지 상태에서 출발해 합류를 마치는 데 필요한 시간 + 여유 (s). 상류 NPC가 이 시간 안에 도착하면 위험
-U_SAFE_MIN, U_SAFE_MAX = 9.0, 15.0   # 상류 안전 호 길이 범위 (m) = clamp(NPC 속도 x T_CLEAR)
+T_CLEAR = 3.9           # 3.7 -> 3.9 (4.2 waited a whole NPC lap on seed 1111111). 정지 상태에서 출발해 합류를 마치는 데 필요한 시간 + 여유 (s). 상류 NPC가 이 시간 안에 도착하면 위험
+U_SAFE_MIN, U_SAFE_MAX = 9.0, 16.0   # 상류 안전 호 길이 범위 (m) = clamp(NPC 속도 x T_CLEAR)
 V_NPC_DEFAULT = 3.5     # NPC 속도를 못 쟀을 때 가정 (m/s). 시뮬레이터 설정은 3.0 m/s x 시드 배율 0.9~1.3 = 2.7~3.9 m/s
 MIN_DANGER_POINTS = 2   # 위험 구간 안의 점이 이 개수 이상이어야 NPC로 봄 (낱개 노이즈 무시)
 CLEAR_FRAMES = 2        # 위험 구간이 이만큼 연속 새 프레임 동안 비면 출발
@@ -84,7 +84,7 @@ ROLL_LATENCY_S = 0.3    # 도착 시간에 더하는 여유 (조향·구동 지�
 GO_SPEED = 5.75         # 진입 후 속도 한계 (m/s): 5.5 ~ 6.0
 EXIT_SPEED = 5.0        # 출구 뒤 R~15 m 커브 속도 한계 (m/s). 7.9 m/s + GNSS 오차 0.5 m로 벽에 닿은 기록(seed 1111111)
 EXIT_CAP_M = 27.0       # 출구(s_exit)에서 이만큼 지날 때까지 EXIT_SPEED 유지 (커브 끝 s~370)
-FOLLOW_SPEED = 2.5      # 앞차를 따라잡았을 때 속도 한계 (m/s)
+FOLLOW_SPEED = 2.5      # 앞차를 따라잡았을 때 최저 속도 한계 (m/s). 실제는 측정한 NPC 속도 - 0.2 (최대 4.0)
 FOLLOW_AHEAD_M = 6.5    # 내 앞 범퍼 기준 이만큼 앞 경로 위에 점이 있으면 앞차로 봄 (m)
 FOLLOW_HALF_W = 1.8     # 경로 중심선에서 이 안쪽 점만 (차 반폭 0.95 + 여유, m)
 FOLLOW_HOLD_S = 0.5     # 앞차가 안 보이게 된 뒤에도 느린 속도를 유지하는 시간 (s)
@@ -106,6 +106,7 @@ class RotaryMission(MissionBase):
         super().__init__(logger)
 
     def reset(self):
+        self.npc_v = V_NPC_DEFAULT
         self.enabled = None        # 이번 시도에서 로터리 옵션이 켜졌는가 (처음 update에서 읽음)
         self.entered = False       # 출발 결정을 내렸는가 (한 번 True가 되면 다시 멈추지 않음)
         self.clear_frames = 0
@@ -237,6 +238,8 @@ class RotaryMission(MissionBase):
         v = min(max(v, 2.0), 8.0)
         u_safe = min(max(v * T_CLEAR, U_SAFE_MIN), U_SAFE_MAX)
         out['v'], out['u_safe'] = v, u_safe
+        if len(speeds) >= 2:
+            self.npc_v = v                                                 # 원 안에서 앞 NPC를 따라갈 속도
         near_up = int((up < u_safe).sum())
         out['danger'] = near_up >= MIN_DANGER_POINTS or down >= MIN_DANGER_POINTS
         return out
@@ -379,7 +382,7 @@ class RotaryMission(MissionBase):
             if int(ahead.sum()) >= MIN_DANGER_POINTS:
                 self.follow_until = inp.t + FOLLOW_HOLD_S
         if inp.t < self.follow_until:
-            v = FOLLOW_SPEED
+            v = min(max(FOLLOW_SPEED, self.npc_v - 0.2), 4.0)              # NPC와 같은 속도: 뒤 NPC가 추돌하지 않게
         return MissionOutput(override_path=self._with_limits(inp.local_path, lambda s_p: v))
 
     # ---- 경로에 속도 한계 붙이기 ------------------------------------------------------------------------

@@ -132,6 +132,7 @@ class ObstacleMission(MissionBase):
         self.last_scan_stamp = None
         self.zone_half_width = 3.75
         self.last_warning = -math.inf
+        self.use_wide = False
 
     def on_enter(self, section):
         # start->cp1 also runs this mission: obstacle1 can sit only ~7 m past cp1 (seed 12345), too late to
@@ -358,8 +359,6 @@ class ObstacleMission(MissionBase):
             self.last_scan_stamp = stamp(inp.scan)
             self._track(self._detect(inp, ego_i, s_ego), s_ego, stamp(inp.scan))
         known = [tr for tr in self.tracks if tr.confirmed and tr.side != 0]
-        for tr in known:
-            tr.offset = min(LANE_OFFSET, self.zone_half_width - 1.892/2 - 0.20)
         # 타겟 선택: 아직 안 지나친 장애물 중 가장 가까운 1개(A), 바로 뒤 12 m 이내에 보이는 다음 1개(B)
         ahead = sorted((tr for tr in known if s_ego < tr.back() + DROP_MARGIN), key=lambda tr: tr.smin)
         elems = []
@@ -373,53 +372,77 @@ class ObstacleMission(MissionBase):
         if not elems:
             return MissionOutput()
 
-        anchors = self._anchors(elems)
-        s_hi = min(s_ego + PATH_AHEAD, float(self.s[-1]))
-        s_lo = max(s_ego - PATH_BEHIND, 0.0)
-        n = int(round((s_hi - s_lo) / PATH_STEP)) + 1
-        if n < 2:
-            return MissionOutput()
-        s_grid = s_lo + PATH_STEP * np.arange(n)
-        off = self._cosine(anchors, s_grid)
-        base = np.stack([np.interp(s_grid, self.s, self.pts[:, 0]), np.interp(s_grid, self.s, self.pts[:, 1])], axis=1)
-        nor = np.stack([np.interp(s_grid, self.s, self.nor[:, 0]), np.interp(s_grid, self.s, self.nor[:, 1])], axis=1)
-        nor /= np.maximum(np.hypot(nor[:, 0], nor[:, 1]), 1e-9)[:, None]
-        new = base + off[:, None] * nor
-        dxy = np.diff(new, axis=0)
-        yaw = np.arctan2(dxy[:, 1], dxy[:, 0])
-        yaw = np.append(yaw, yaw[-1])
-        # Check the swept body, not only the rear-axle centre. Stop if the
-        # observed obstacle/road geometry cannot accommodate this maneuver.
-        route_heading = np.arctan2(np.interp(s_grid, self.s, self.tan[:, 1]),
-                                   np.interp(s_grid, self.s, self.tan[:, 0]))
-        rel = yaw - route_heading
-        safe = True
-        safety_reason = ''
-        margin = 0.15 + min(0.15, max(0.0, inp.pose_sigma) * 0.4)
-        for front in (-0.79, FRONT_OVERHANG):
-            for side in (-1.892/2, 1.892/2):
-                corner_d = off + front*np.sin(rel) + side*np.cos(rel)
-                if np.any(np.abs(corner_d) > self.zone_half_width - margin):
+        def plan(offset):
+            for tr in known:
+                tr.offset = offset
+            anchors = self._anchors(elems)
+            s_hi = min(s_ego + PATH_AHEAD, float(self.s[-1]))
+            s_lo = max(s_ego - PATH_BEHIND, 0.0)
+            n = int(round((s_hi - s_lo) / PATH_STEP)) + 1
+            if n < 2:
+                return None
+            s_grid = s_lo + PATH_STEP * np.arange(n)
+            off = self._cosine(anchors, s_grid)
+            base = np.stack([np.interp(s_grid, self.s, self.pts[:, 0]), np.interp(s_grid, self.s, self.pts[:, 1])], axis=1)
+            nor = np.stack([np.interp(s_grid, self.s, self.nor[:, 0]), np.interp(s_grid, self.s, self.nor[:, 1])], axis=1)
+            nor /= np.maximum(np.hypot(nor[:, 0], nor[:, 1]), 1e-9)[:, None]
+            new = base + off[:, None] * nor
+            dxy = np.diff(new, axis=0)
+            yaw = np.arctan2(dxy[:, 1], dxy[:, 0])
+            yaw = np.append(yaw, yaw[-1])
+            # Check the swept body, not only the rear-axle centre. Stop if the
+            # observed obstacle/road geometry cannot accommodate this maneuver.
+            route_heading = np.arctan2(np.interp(s_grid, self.s, self.tan[:, 1]),
+                                       np.interp(s_grid, self.s, self.tan[:, 0]))
+            rel = yaw - route_heading
+            safe = True
+            safety_reason = ''
+            margin = 0.15 + min(0.15, max(0.0, inp.pose_sigma) * 0.4)
+            for front in (-0.79, FRONT_OVERHANG):
+                for side in (-1.892/2, 1.892/2):
+                    corner_d = off + front*np.sin(rel) + side*np.cos(rel)
+                    if np.any(np.abs(corner_d) > self.zone_half_width - margin):
+                        safe = False
+                        safety_reason = f'도로 여유 (모서리 {np.max(np.abs(corner_d)):.2f}, 한계 {self.zone_half_width-margin:.2f}m)'
+            # Conservative rectangle projection at each path sample against each
+            # confirmed vehicle. This does not use true/simulator object positions.
+            half_width = 1.892 / 2.0
+            s_min = s_grid + np.minimum(-.79*np.cos(rel), FRONT_OVERHANG*np.cos(rel)) - half_width*np.abs(np.sin(rel))
+            s_max = s_grid + np.maximum(-.79*np.cos(rel), FRONT_OVERHANG*np.cos(rel)) + half_width*np.abs(np.sin(rel))
+            d_min = off + np.minimum(-.79*np.sin(rel), FRONT_OVERHANG*np.sin(rel)) - half_width*np.abs(np.cos(rel))
+            d_max = off + np.maximum(-.79*np.sin(rel), FRONT_OVERHANG*np.sin(rel)) + half_width*np.abs(np.cos(rel))
+            for tr in known:
+                overlap = (s_max > tr.smin-margin) & (s_min < tr.back()+margin)
+                if np.any(overlap & (d_max > tr.dmin-margin) & (d_min < tr.dmax+margin)):
                     safe = False
-                    safety_reason = f'도로 여유 (모서리 {np.max(np.abs(corner_d)):.2f}, 한계 {self.zone_half_width-margin:.2f}m)'
-        # Conservative rectangle projection at each path sample against each
-        # confirmed vehicle. This does not use true/simulator object positions.
-        half_width = 1.892 / 2.0
-        s_min = s_grid + np.minimum(-.79*np.cos(rel), FRONT_OVERHANG*np.cos(rel)) - half_width*np.abs(np.sin(rel))
-        s_max = s_grid + np.maximum(-.79*np.cos(rel), FRONT_OVERHANG*np.cos(rel)) + half_width*np.abs(np.sin(rel))
-        d_min = off + np.minimum(-.79*np.sin(rel), FRONT_OVERHANG*np.sin(rel)) - half_width*np.abs(np.cos(rel))
-        d_max = off + np.maximum(-.79*np.sin(rel), FRONT_OVERHANG*np.sin(rel)) + half_width*np.abs(np.cos(rel))
-        for tr in known:
-            overlap = (s_max > tr.smin-margin) & (s_min < tr.back()+margin)
-            if np.any(overlap & (d_max > tr.dmin-margin) & (d_min < tr.dmax+margin)):
-                safe = False
-                bad = overlap & (d_max > tr.dmin-margin) & (d_min < tr.dmax+margin)
-                safety_reason = (f'장애물 여유 s={tr.s:.1f}, d={tr.d:.2f} tr s[{tr.smin:.1f},{tr.back():.1f}] '
-                                 f'd[{tr.dmin:.2f},{tr.dmax:.2f}] off={tr.offset:.2f} m={margin:.2f} '
-                                 f'car d[{d_min[bad].min():.2f},{d_max[bad].max():.2f}] at s {s_grid[bad].min():.1f}-{s_grid[bad].max():.1f} ego {s_ego:.1f}')
+                    bad = overlap & (d_max > tr.dmin-margin) & (d_min < tr.dmax+margin)
+                    safety_reason = (f'장애물 여유 s={tr.s:.1f}, d={tr.d:.2f} tr s[{tr.smin:.1f},{tr.back():.1f}] '
+                                     f'd[{tr.dmin:.2f},{tr.dmax:.2f}] off={tr.offset:.2f} m={margin:.2f} '
+                                     f'car d[{d_min[bad].min():.2f},{d_max[bad].max():.2f}] at s {s_grid[bad].min():.1f}-{s_grid[bad].max():.1f} ego {s_ego:.1f}')
+            return safe, safety_reason, new, yaw, s_grid
+
+        # Default 2.05 m offset first. If the swept body would touch the obstacle (wide/noisy track), retry with the
+        # widest offset the road allows instead of stopping on the spot; stop only when that also cannot clear it.
+        default_off = min(LANE_OFFSET, self.zone_half_width - 1.892/2 - 0.20)
+        wide_off = self.zone_half_width - 1.892/2 - 0.32
+        result = None
+        offsets = (default_off, wide_off) if wide_off > default_off + 0.05 else (default_off,)
+        if self.use_wide:                               # 한 번 넓혔으면 이 구간 동안 유지 (경로가 오가며 흔들리지 않게)
+            offsets = offsets[-1:]
+        for offset in offsets:
+            result = plan(offset)
+            if result is None:
+                return MissionOutput()
+            if result[0]:
+                if offset != default_off and not self.use_wide:
+                    self.use_wide = True
+                    if self.log:
+                        self.log.info(f'장애물 회피 폭을 {offset:.2f} m로 넓혀 정지 없이 통과')
+                break
+        safe, safety_reason, new, yaw, s_grid = result
         if not safe:
             if self.log and inp.t - self.last_warning > 1.0:
-                self.log.warn('회피 경로 차체 여유 부족: ' + safety_reason)
+                self.log.warn('회피 경로 차체 여유 부족(넓힌 회피 폭으로도 불가) -> 정지: ' + safety_reason)
                 self.last_warning = inp.t
             return MissionOutput(override_cmd=(0.0, 1.0, 0.0, 'D'))
         end_maneuver = max(tr.hi() + RETURN_M for tr in elems)
