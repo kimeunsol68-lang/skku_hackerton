@@ -565,7 +565,7 @@ RPARAMS = {                              # 후면 주차 (T자 통로) 값
     'rpark_v_exit': 3.0,                 # 탈출: 호 구간 속력
     'rpark_v_exit_fast': 6.0,            # 탈출: 직선 구간 최고 속력
     'rpark_a_dec': 2.0,                  # 호 앞 감속 계획 (m/s^2)
-    'rpark_v_reverse': 3.0,              # 후면 주차 후진 속력 (끝이 가까우면 감속)
+    'rpark_v_reverse': 3.8,              # 후면 주차 후진 속력 (끝이 가까우면 감속)
     'rpark_exit_north': 0.3,             # 탈출 때 통로 안에서 중심선보다 북쪽으로 붙는 양 (m)
     'rpark_exit_r3': 4.6,
     'rpark_exit_r4': 4.6,
@@ -901,7 +901,7 @@ class RearParking(Parking):
             if left <= self.rev_tol:
                 self._set('STOP_REV', now)
                 return 0.0, 1.0, 0.0, R
-            v_t = max(0.4, min(p['rpark_v_reverse'], 0.4 + 1.6 * left))      # 끝에 가까울수록 감속 (1.1 -> 1.6: 후진 시간 단축)
+            v_t = max(0.4, min(p['rpark_v_reverse'], 0.4 + 2.0 * left))      # 끝에 가까울수록 감속 (1.1 -> 1.6: 후진 시간 단축)
             acc, brk = self._speed(v_t, v, dt)
             return acc, brk, steer, R
         if st == 'STOP_REV':

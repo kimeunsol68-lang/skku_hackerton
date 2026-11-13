@@ -61,12 +61,15 @@ from .sim_events import SimEvents
 # 아래는 yaml에 값이 없을 때 쓰는 기본값입니다.
 TARGET_SPEED_DEFAULT = 5.0
 # 공격 모드 값 (2차 시도 전용). 안전 모드 값은 bringup.yaml (a_lat_max 3.0, a_lat_lowmu 1.3 ...)
+OPEN_V_MAX = 20.0           # 박스(seed로 바뀌는 구간) 밖 최고속도
+OPEN_A_LAT = 5.0            # 박스 밖 커브 횡가속 한계 (팀원 기록: 3.8+v_max15에서 cp2 뒤·cp5 뒤 커브 충돌)
+
 FAST_PARAMS = {
     'a_lat_max': 3.5,       # 마른 노면 커브 (안전 3.0). 3.8 + v_max 15에서 cp2 뒤·cp5 뒤 커브 충돌
     'a_decel': 3.0,         # 커브 앞 감속 계획
-    'a_lat_lowmu': 1.65,    # 저마찰 커브 (안전 1.3, mu=0.2 한계 1.96)
+    'a_lat_lowmu': 1.15,    # 저마찰: 1.3 이상 seed 22 충돌, 1.0 무사고(34 s) -> 1.15
     'a_lat_slope': 3.5,     # 경사 헤어핀 (안전 3.0)
-    'v_max_obstacle': 6.5,  # 장애물 구간 (안전 5.0)
+    'v_max_obstacle': 7.0,  # 7.5는 seed 25 저마찰 입구 충돌 -> 팀원 원래 값 6.5
 }
 
 PARAMS = {
@@ -225,6 +228,8 @@ class Control(Node):
                 self._zone_kinds = kinds
                 self.get_logger().info(f'속도 제한을 적용하는 구역: {", ".join(kinds) or "없음"}'
                                        + ('' if options is not None else ' (옵션 파일을 못 읽어 전부 켬)'))
+            self._boxes = [[tuple(p) for p in m['zone']] for m in missions if m.get('zone') and m.get('type') != 'gnss_shadow']
+            self._shadow = [[tuple(p) for p in m['zone']] for m in missions if m.get('type') == 'gnss_shadow' and m.get('zone')]
             return {m['type']: [tuple(p) for p in m['zone']] for m in missions
                     if m.get('type') in kinds and m.get('zone')}
         except Exception as e:
@@ -415,6 +420,9 @@ class Control(Node):
         self._curv_src, self._curv, self._s = path, k, s
         self._low = [self.in_zone('low_friction', p[0], p[1]) for p in path]
         self._slope = [self.in_zone('slope', p[0], p[1]) for p in path]
+        boxes = getattr(self, '_boxes', [])
+        self._open = [not any(point_in_polygon(b, p[0], p[1]) for b in boxes) for p in path]
+        self._shad = [any(point_in_polygon(b, p[0], p[1]) for b in getattr(self, '_shadow', [])) for p in path]
         obst = [self.in_zone('obstacle1', p[0], p[1]) or self.in_zone('obstacle3', p[0], p[1]) for p in path]
         self._obst, nxt = [False] * n, None         # 장애물 구역 입구 obstacle_lead_m 앞부터 구역 끝까지
         for i in range(n - 1, -1, -1):
@@ -471,6 +479,10 @@ class Control(Node):
                 hi = min(hi, self.v_max_obstacle)
                 lo = min(lo, hi)                     # v_min(4.5)이 구간 최고 속도보다 크면 구간 속도가 무시되므로 같이 낮춤
                 reason = 'obstacle_zone'
+            if self._open[i] and not low[i] and not self._obst[i]:   # seed 무관 구간(박스 밖): 최고속도 상한 해제
+                hi = OPEN_V_MAX
+                a_lat = OPEN_A_LAT
+                reason = 'open'
             curve_limit = math.sqrt(a_lat / max(abs(c), 1e-6))
             vi = min(hi, curve_limit)                # a speed floor must never defeat a corner limit
             if curve_limit < hi:
@@ -491,6 +503,8 @@ class Control(Node):
                 while j + 1 < n and s[j + 1] - s[i] <= self.corner_hold_m:
                     j += 1
                 m = min(vc[i:j + 1])
+                if self._open[i]:
+                    continue
                 if m < self.corner_hold_vmax and m + self.corner_hold_margin < hold[i]:
                     hold[i] = m + self.corner_hold_margin
                     reasons[i] = 'corner_hold'
