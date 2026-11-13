@@ -64,7 +64,7 @@ PARAMS = {                               # config/bringup.yaml (hk_mit_control)�
     'park_tol_margin': 0.1,              # 차 네 모서리가 슬롯 안쪽으로 이만큼 더 들어와야 완료로 봄 (m)
     'park_exit_heading_deg': 40.0,       # 탈출 때 이만큼 왼쪽으로 돌면 경로 추종으로 넘김
     'park_exit_rear_clear': 0.4,         # 탈출 후진 때 뒤차와 남길 간격 (m)
-    'park_debug': 1.0,                   # 1이면 ~/park/ 에 추적 CSV·LiDAR 점을 남김
+    'park_debug': 0.0,                   # 1이면 ~/park/ 에 추적 CSV·LiDAR 점을 남김
 }
 
 
@@ -372,7 +372,7 @@ class Parking:
             steer = self._stanley(path, x, y, yaw, speed) if path else 0.0
             return acc, brk, steer, GEAR_DRIVE
         if st == 'STOP':
-            if self._stopped(v, now) or now - self.t_state > 6.0:
+            if self._stopped(v, now):
                 self._plan_reverse(a, b)
                 self._set('SHIFT_R', now)
             return 0.0, 1.0, 0.0, GEAR_DRIVE
@@ -417,6 +417,13 @@ class Parking:
                 self._after_stop(a, b, psi, now)
             return 0.0, 1.0, 0.0, GEAR_REVERSE if self.dir < 0 else GEAR_DRIVE
         if st == 'HOLD':
+            if not self.inside(a, b, psi, 0.05 + p['park_tol_margin']) or abs(psi) > math.radians(20):
+                self.t_hold0 = None
+                self._set('STOP_ADJ', now)
+                return 0.0, 1.0, 0.0, GEAR_REVERSE if self.dir < 0 else GEAR_DRIVE
+            if v > 0.05:
+                self.t_hold0 = None
+                return 0.0, 1.0, 0.0, GEAR_REVERSE if self.dir < 0 else GEAR_DRIVE
             if self.t_hold0 is None:
                 self.t_hold0 = now
             if now - self.t_hold0 >= p['park_hold_s']:
@@ -461,7 +468,7 @@ class Parking:
         p = self.p
         ok = self.inside(a, b, psi, 0.05 + p['park_tol_margin'])
         self.log(f'parking: 정지 a={a:.2f} b={b:.2f} psi={math.degrees(psi):.1f}도 안={ok} 보정 {self.adjust_n}')
-        if ok or self.adjust_n >= 4:
+        if ok and abs(psi) <= math.radians(20):
             self._set('HOLD', now)
             return
         self.adjust_n += 1
@@ -521,9 +528,14 @@ def build_path(start, prims, ds=0.1):
     out = [(x, y, h)]
     for p in prims:
         if p[0] == 'S':
-            for _ in range(max(1, int(p[1] / ds))):
-                x += ds * math.cos(h)
-                y += ds * math.sin(h)
+            length = max(0.0, float(p[1]))
+            if length == 0.0:
+                continue
+            count = max(1, math.ceil(length / ds))
+            step = length / count
+            for _ in range(count):
+                x += step * math.cos(h)
+                y += step * math.sin(h)
                 out.append((x, y, h))
         else:
             ang, R = p[1], p[2]
@@ -735,7 +747,7 @@ class RearParking(Parking):
             acc, brk = self._speed(self._path_speed(i, p['rpark_v_enter_fast'], p['rpark_v_enter']), v, dt)
             return acc, brk, steer, D
         if st == 'STOP':
-            if self._stopped(v, now) or now - self.t_state > 6.0:
+            if self._stopped(v, now):
                 self.y_tgt = self.slot_c() + (CAR_LEN / 2 - REAR_OVERHANG)
                 self.path = self._reverse_path(x, y)
                 self.rev_tol = 0.15                                  # 후진 정지 앞당김: 0.3이면 약 0.13 m 덜 들어가 보정이 한 번 필요했음
@@ -754,17 +766,25 @@ class RearParking(Parking):
                 self.wall_y = y + REAR_OVERHANG + gap            # 안쪽 벽의 y
                 # 목표 = 벽 실측으로 잡은 슬롯 중심에 차 중심이 오는 위치 (통로 기준 추정값보다 정확)
                 left = (self.wall_y - p['rpark_wall_to_c'] + (CAR_LEN / 2 - REAR_OVERHANG)) - y
+            # Keep a bumper clearance even during corrective reverse motions.
+            if gap is not None and gap <= p['rpark_gap_stop'] + v * 0.0825 + v * v / (2 * p['rpark_a_dec']):
+                self._set('STOP_REV', now)
+                return 0.0, 1.0, 0.0, R
             if left <= self.rev_tol:
                 self._set('STOP_REV', now)
                 return 0.0, 1.0, 0.0, R
-            v_t = max(0.5, min(p['rpark_v_reverse'], 0.5 + 1.1 * left))      # 끝에 가까울수록 부드럽게 감속
+            stopping_room = max(0.0, left - self.rev_tol)
+            # Include the worst documented drive/brake delay (75 ms * 1.1).
+            decel, delay = p['rpark_a_dec'], 0.0825
+            v_t = min(p['rpark_v_reverse'],
+                      max(0.15, math.sqrt((decel * delay) ** 2 + 2 * decel * stopping_room) - decel * delay))      # 끝에 가까울수록 부드럽게 감속
             acc, brk = self._speed(v_t, v, dt)
             return acc, brk, steer, R
         if st == 'STOP_REV':
             if self._stopped(v, now):
                 ok, a, b, psi = self._in_slot(x, y, yaw)
                 self.log(f'rear: 정지 벽y={self.wall_y} x={x:.2f} y={y:.2f} a={a:.2f} b={b:.2f} psi={math.degrees(psi):.1f}도 안={ok} 시도 {self.tries}')
-                if ok or self.tries >= 3:
+                if ok and abs(psi) <= math.radians(20):
                     self._set('HOLD', now)
                 else:
                     self.tries += 1
@@ -803,6 +823,14 @@ class RearParking(Parking):
             acc, brk = self._speed(0.8, v, dt)
             return acc, brk, steer, D
         if st == 'HOLD':
+            ok, _, _, psi = self._in_slot(x, y, yaw)
+            if not ok or abs(psi) > math.radians(20):
+                self.t_hold0 = None
+                self._set('STOP_REV', now)
+                return 0.0, 1.0, 0.0, R
+            if v > 0.05:
+                self.t_hold0 = None
+                return 0.0, 1.0, 0.0, R
             if self.t_hold0 is None:
                 self.t_hold0 = now
             if now - self.t_hold0 >= p['park_hold_s']:
