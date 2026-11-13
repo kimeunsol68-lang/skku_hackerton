@@ -52,14 +52,14 @@ PARAMS = {                               # config/bringup.yaml (hk_mit_control)�
     'park_start_y': 140.0,               # 이 y보다 내려오면 주차 모드 시작
     'park_end_y': 100.0,                 # (주차 전) 이 y보다 내려가면 주차 모드가 아님
     'park_v_approach': 6.0,              # 접근 속력 (m/s)
-    'park_v_reverse': 1.8,               # 후진 속력 (m/s) (잔걸음 대신 한번에 또렷하게: 1.2 -> 1.8)
-    'park_v_reverse_fast': 2.0,          # straight portions only
+    'park_v_reverse': 2.0,               # 후진 속력 (m/s) (잔걸음 대신 한번에 또렷하게: 1.2 -> 2.0)
+    'park_v_reverse_fast': 2.2,          # straight portions only
     'park_delay': 0.25,                  # planner replaces this with actual option delay
-    'park_v_exit': 2.5,                  # 평행 주차 탈출 전진 속력 (m/s)
+    'park_v_exit': 3.0,                  # 평행 주차 탈출 전진 속력 (m/s)
     'park_v_adjust': 1.4,                # 보정·탈출 속력 (m/s) (잔걸음(0.3~0.5) 대신 한번에: 1.4)
     'park_phase_timeout_s': 9.0,         # 후진/전진 등 한 phase 최대 시간 (s). 넘으면 다음 단계로 강제 전환 (정상 후진 ~7 s는 끊지 않게)
     'park_total_timeout_s': 22.0,        # 전체 주차 시도 최대 시간 (s). 넘으면 멈춘 자리에서 완료 처리 (영구 멈춤 방지)
-    'park_decel': 1.5,                   # 접근 감속 계획 (m/s^2)
+    'park_decel': 1.8,                   # 접근 감속 계획 (m/s^2)
     'park_a_shift': 0.8,                 # 목표를 슬롯 중심보다 뒤로 당기는 양 (m). 앞 벽 모서리와의 간격 확보
     'park_radius': 4.5,                  # 후진 호 반지름 (m). 최소 4.22 (조향 최대)
     'park_stop_margin': 0.3,             # 정지 목표 앞당김 (m)
@@ -554,10 +554,10 @@ RPARAMS = {                              # 후면 주차 (T자 통로) 값
     'rpark_r2': 4.6,                     # 안쪽에서 오른쪽(남쪽) 회전 반지름
     'rpark_gin': 0.5,                    # 통로 안에서 중심선보다 북쪽으로 붙는 양 (m)
     'rpark_v_enter': 3.0,                # 진입: 호(회전) 구간 속력
-    'rpark_v_enter_fast': 4.0,           # 진입: 직선 구간 최고 속력 (호 앞에서 미리 감속)
+    'rpark_v_enter_fast': 5.0,           # 진입: 직선 구간 최고 속력 (호 앞에서 미리 감속)
     'rpark_v_exit': 3.0,                 # 탈출: 호 구간 속력
-    'rpark_v_exit_fast': 5.0,            # 탈출: 직선 구간 최고 속력
-    'rpark_a_dec': 1.5,                  # 호 앞 감속 계획 (m/s^2)
+    'rpark_v_exit_fast': 6.0,            # 탈출: 직선 구간 최고 속력
+    'rpark_a_dec': 2.0,                  # 호 앞 감속 계획 (m/s^2)
     'rpark_v_reverse': 3.0,              # 후면 주차 후진 속력 (끝이 가까우면 감속)
     'rpark_exit_north': 0.3,             # 탈출 때 통로 안에서 중심선보다 북쪽으로 붙는 양 (m)
     'rpark_exit_r3': 4.6,

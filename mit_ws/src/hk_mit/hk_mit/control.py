@@ -97,6 +97,7 @@ PARAMS = {
     'obstacle_lead_m': 12.0,  # 장애물 구역 입구 이만큼(m) 앞에서부터 이미 v_max_obstacle로 달리게 함
     'lowmu_enabled': 1.0,  # 1: 저마찰 구역 대응 켬, 0: 끔 (시뮬레이터 저마찰 옵션을 끄고 달릴 때 0으로 두면 원래 속도로 달림)
     'lowmu_lead_m': 12.0,  # 저마찰 구역 경계가 어긋나도 안전하도록, 구역 앞 이만큼(m)부터 저마찰 속도 한계를 적용
+    'lowmu_brake_lead_m': 4.0,  # 구역 앞 이만큼(m)부터는 저마찰 감속(a_decel_lowmu)으로 계획. 그보다 앞(마른 노면)에서는 a_decel로 제동
     'k_stanley_lowmu': 2.0,   # 저마찰 구간 Stanley 옆오차 이득 (저속에서 조향을 끝까지 쓰도록)
     'k_soft_lowmu': 0.3,   # 저마찰 구간 Stanley 저속 완화값 (m/s). 작을수록 저속에서 더 적극적
     'k_heading_lowmu': 1.0,   # 저마찰 구간 방향 오차(전방 주시) 가중치
@@ -403,12 +404,13 @@ class Control(Node):
             if obst[i]:
                 nxt = s[i]
             self._obst[i] = nxt is not None and nxt - s[i] <= self.obstacle_lead_m
-        plan, nxt = [False] * n, None               # 계획용: 저마찰 구역 앞 lowmu_lead_m 구간도 저마찰로 봄
+        plan, brake, nxt = [False] * n, [False] * n, None   # 계획용: 저마찰 구역 앞 lowmu_lead_m 구간도 저마찰로 봄
         for i in range(n - 1, -1, -1):
             if self._low[i]:
                 nxt = s[i]
             plan[i] = nxt is not None and nxt - s[i] <= self.lowmu_lead_m
-        self._low_plan = plan
+            brake[i] = nxt is not None and nxt - s[i] <= self.lowmu_brake_lead_m   # 감속 계획만 저마찰 값으로 (속도 상한은 plan)
+        self._low_plan, self._low_brake = plan, brake
         return k
 
     def brake_feedforward(self):
@@ -469,7 +471,7 @@ class Control(Node):
                     reasons[i] = 'corner_hold'
             v = hold
         for i in range(n - 2, -1, -1):               # 앞쪽 점의 속도에서 감속으로 줄일 수 있는 속도까지만 허용
-            a_dec = self.a_decel_lowmu if low[i] else self.a_decel
+            a_dec = self.a_decel_lowmu if self._low_brake[i] else self.a_decel   # 구역 앞 마른 노면에서는 평소 감속으로 늦게 제동
             limit = math.sqrt(v[i + 1] ** 2 + 2.0 * a_dec * (s[i + 1] - s[i]))
             if limit < v[i]:
                 v[i], reasons[i] = limit, 'braking_ahead'
