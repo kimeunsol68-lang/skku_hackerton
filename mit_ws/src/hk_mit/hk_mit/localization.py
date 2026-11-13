@@ -1,14 +1,15 @@
 """MIT 위치 추정: 바퀴·IMU 예측 + GNSS 보정, 50 Hz odom/TF.
 
-(x, y, yaw, 자이로 편향)을 추정하는 EKF. GNSS 음영에서도 이동을 예측하고,
-GNSS의 잡음·이상값과 IMU 편향을 보정한다. 정지 중에는 자이로 영점을 보정한다.
+(x, y, yaw, 자이로 편향, GNSS의 느린 x/y 오차)를 추정하는 EKF.
+속도·회전·가감속에 따라 위치 예측 신뢰도를 조절하고 GNSS의 빠른 잡음과 느린 치우침을 구분한다.
+GNSS 음영에서는 바퀴·IMU로 이동을 예측한다. 정지 중 자이로 영점, 완만한 구간의 궤적 방향을 보정한다.
 경로에 위치를 강제로 맞추지 않으므로 회피·후진에도 사용할 수 있다.
 이 파일만 교체하면 된다. numpy는 대회 Docker 이미지에 포함되어 있다.
 조정값은 DEFAULTS 및 같은 이름의 ROS 파라미터에 있다.
 """
 import heapq
 import math
-from collections import Counter
+from collections import Counter, deque
 
 import numpy as np
 import rclpy
@@ -24,7 +25,9 @@ from .utm import ll_to_map
 
 RATE_HZ = 50.0
 DEFAULTS = {
-    'gps_sigma': 0.70,              # GNSS 위치 표준편차 가정 (m)
+    'gps_sigma': 0.60,              # GNSS의 빠른 위치 잡음 표준편차 가정 (m)
+    'gps_bias_sigma': 0.20,         # 천천히 변하는 GNSS 공통 오차의 표준편차 가정 (m)
+    'gps_bias_tau': 10.0,           # GNSS 공통 오차의 시간 상관 길이 (s)
     'gps_update_period': 0.15,      # 상관된 GPS를 과신하지 않도록 보정 간격 제한 (s)
     'gps_gate': 25.0,               # 정규화한 2차원 위치 잔차 제곱의 상한
     'max_gps_step': 0.25,           # GNSS 보정 한 번의 최대 위치 이동 (m)
@@ -34,6 +37,15 @@ DEFAULTS = {
     'stationary_gyro_sigma': 0.008, # 정지 중 자이로 영점 측정 표준편차 (rad/s)
     'sensor_timeout': 0.30,         # 오래된 속도·각속도는 계속 적분하지 않음 (s)
     'fusion_delay': 0.04,          # 토픽 사이 수신 순서를 정렬할 여유 (s)
+    'speed_noise_gain': 0.025,     # 속도가 커질 때 위치 예측 불확실성 증가
+    'turn_noise_gain': 0.15,       # 회전 중 횡방향 모델 오차를 더 허용
+    'accel_noise_gain': 0.02,      # 가감속 중 바퀴 기반 예측 불확실성 증가
+    'heading_window': 5.0,        # GNSS 궤적과 추측항법을 비교할 시간 (s)
+    'heading_distance': 8.0,      # 방향 비교에 필요한 최소 이동 거리 (m)
+    'heading_period': 2.5,        # 겹치는 GPS 궤적을 연속으로 과신하지 않도록 간격 제한 (s)
+    'heading_sigma': 0.04,        # 궤적 방향 측정의 최소 표준편차 (rad)
+    'heading_max_step': 0.003,    # 방향 보정 한 번의 상한 (rad)
+    'heading_max_turn': 0.35,     # 방향 맞춤은 완만한 구간에서만 사용 (rad)
 }
 
 
@@ -51,12 +63,19 @@ class PoseFilter:
         self.cfg = dict(DEFAULTS)
         if parameters:
             self.cfg.update(parameters)
-        self.state = np.array([*pose, 0.0], dtype=float)
-        self.cov = np.diag([0.08**2, 0.08**2, math.radians(0.5)**2, 0.005**2])
+        # 차량 상태 4개 + GNSS의 천천히 변하는 x/y 오차 2개.
+        self.state = np.array([*pose, 0.0, 0.0, 0.0], dtype=float)
+        self.cov = np.diag([0.08**2, 0.08**2, math.radians(0.5)**2, 0.005**2,
+                            self.cfg['gps_bias_sigma']**2, self.cfg['gps_bias_sigma']**2])
         self.time = float(timestamp)
         self.speed = self.rate = 0.0
         self.wheel_time = self.imu_time = None
         self.still_since = self.last_gps_update = None
+        self.acceleration = 0.0
+        self.dead_pose = np.array([0.0, 0.0, pose[2]], dtype=float)
+        self.gps_history = deque()
+        self.last_heading_update = None
+        self.diagnostics = {}
         self.counts = Counter()
 
     def motion(self, timestamp):
@@ -65,13 +84,23 @@ class PoseFilter:
         rate = self.rate if self.imu_time is not None and 0 <= timestamp - self.imu_time <= timeout else None
         return speed, rate
 
-    def _predict(self, state, cov, begin, end):
+    def _predict(self, state, cov, begin, end, track_motion=False):
         remaining = end - begin
         if remaining <= 0:
             return state, cov
         if remaining > 1.0:
             # 센서 전체의 긴 공백을 오래된 입력으로 채우지 않는다.
-            return state, cov + np.diag([4.0, 4.0, 0.03, 0.00001]) * min(remaining, 30.0)
+            state = state.copy()
+            decay = math.exp(-remaining / self.cfg['gps_bias_tau'])
+            transition = np.diag([1., 1., 1., 1., decay, decay])
+            state[4:] *= decay
+            bias_noise = self.cfg['gps_bias_sigma']**2 * (1.0-decay**2)
+            noise = np.diag([4.0, 4.0, 0.03, 0.00001, 0., 0.]) * min(remaining, 30.0)
+            noise[4, 4] = noise[5, 5] = bias_noise
+            if track_motion:
+                self.gps_history.clear()
+                self.dead_pose = np.array([0., 0., state[2]])
+            return state, transition @ cov @ transition.T + noise
         while remaining > 1e-9:
             dt = min(remaining, 0.05)
             speed, measured_rate = self.motion(begin + dt * 0.5)
@@ -80,7 +109,9 @@ class PoseFilter:
             mid_yaw = state[2] + omega * dt * 0.5
             distance = speed * dt
             s, c = math.sin(mid_yaw), math.cos(mid_yaw)
-            transition = np.eye(4)
+            transition = np.eye(6)
+            gps_bias_decay = math.exp(-dt / self.cfg['gps_bias_tau'])
+            transition[4, 4] = transition[5, 5] = gps_bias_decay
             transition[0, 2], transition[1, 2] = -distance * s, distance * c
             if measured_rate is not None and moving:
                 transition[0, 3] = 0.5 * distance * dt * s
@@ -90,11 +121,25 @@ class PoseFilter:
             state[0] += distance * c
             state[1] += distance * s
             state[2] = wrap(state[2] + omega * dt)
+            state[4:] *= gps_bias_decay
+            gps_bias_noise = self.cfg['gps_bias_sigma']**2 * (1.0 - gps_bias_decay**2)
             noise = np.diag([self.cfg['position_noise']**2 * dt,
                              self.cfg['position_noise']**2 * dt,
                              self.cfg['gyro_noise']**2 * dt,
-                             self.cfg['bias_walk']**2 * dt])
+                             self.cfg['bias_walk']**2 * dt, gps_bias_noise, gps_bias_noise])
+            # 가속·회전 때 바퀴 적분을 과신하지 않는다. 전진·후진 모두 동일한 규칙.
+            forward_sigma = self.cfg['speed_noise_gain'] * abs(speed) + self.cfg['accel_noise_gain'] * abs(self.acceleration)
+            lateral_sigma = self.cfg['turn_noise_gain'] * abs(speed * omega)
+            forward_axis, lateral_axis = np.array([c, s]), np.array([-s, c])
+            noise[:2, :2] += dt * (forward_sigma**2 * np.outer(forward_axis, forward_axis)
+                                   + lateral_sigma**2 * np.outer(lateral_axis, lateral_axis))
             cov = transition @ cov @ transition.T + noise
+            if track_motion:
+                self.diagnostics['forward_model_sigma'] = forward_sigma
+                self.diagnostics['lateral_model_sigma'] = lateral_sigma
+                dead_mid = self.dead_pose[2] + omega * dt * 0.5
+                self.dead_pose[:2] += distance * np.array([math.cos(dead_mid), math.sin(dead_mid)])
+                self.dead_pose[2] = wrap(self.dead_pose[2] + omega * dt)
             begin += dt
             remaining = end - begin
         return state, (cov + cov.T) * 0.5
@@ -103,13 +148,20 @@ class PoseFilter:
         if timestamp < self.time - 1e-6:
             self.counts['old_measurement'] += 1
             return False
-        self.state, self.cov = self._predict(self.state, self.cov, self.time, timestamp)
+        self.state, self.cov = self._predict(self.state, self.cov, self.time, timestamp, track_motion=True)
         self.time = max(self.time, timestamp)
         return True
 
     def wheel(self, timestamp, speed):
         if not math.isfinite(speed) or not self.advance(timestamp):
             return
+        if self.wheel_time is not None:
+            dt = timestamp - self.wheel_time
+            if 1e-4 < dt <= self.cfg['sensor_timeout']:
+                raw_acceleration = float(np.clip((speed - self.speed) / dt, -8.0, 8.0))
+                self.acceleration += (1.0 - math.exp(-dt / 0.25)) * (raw_acceleration - self.acceleration)
+            elif dt > self.cfg['sensor_timeout']:
+                self.acceleration = 0.0
         self.speed, self.wheel_time = float(speed), timestamp
         if abs(speed) < 0.04:
             if self.still_since is None:
@@ -127,7 +179,7 @@ class PoseFilter:
             variance = self.cfg['stationary_gyro_sigma']**2
             gain = self.cov[:, 3] / (self.cov[3, 3] + variance)
             self.state += gain * (rate - self.state[3])
-            residual = np.eye(4)
+            residual = np.eye(6)
             residual[:, 3] -= gain
             self.cov = residual @ self.cov @ residual.T + np.outer(gain, gain) * variance
             self._normalize()
@@ -136,33 +188,94 @@ class PoseFilter:
     def gps(self, timestamp, x, y):
         if not all(math.isfinite(value) for value in (x, y)) or not self.advance(timestamp):
             return
-        if self.last_gps_update is not None and timestamp - self.last_gps_update < self.cfg['gps_update_period'] - 1e-6:
-            return
-        innovation = np.array([x, y]) - self.state[:2]
+        measurement = np.array([[1., 0., 0., 0., 1., 0.], [0., 1., 0., 0., 0., 1.]])
+        innovation = np.array([x, y]) - measurement @ self.state
         measurement_cov = np.eye(2) * self.cfg['gps_sigma']**2
-        innovation_cov = self.cov[:2, :2] + measurement_cov
+        innovation_cov = measurement @ self.cov @ measurement.T + measurement_cov
         score = float(innovation @ np.linalg.solve(innovation_cov, innovation))
         if score > self.cfg['gps_gate']:
             self.counts['gps_rejected'] += 1
             return
+        self.diagnostics['gps_residual_m'] = float(np.linalg.norm(innovation))
+        self.diagnostics['gps_nis'] = score
+        self._trajectory_heading(timestamp, x, y)
+        if self.last_gps_update is not None and timestamp - self.last_gps_update < self.cfg['gps_update_period'] - 1e-6:
+            return
+        # 궤적 방향 보정으로 공분산이 바뀔 수 있으므로 위치 이득은 다시 계산한다.
+        innovation = np.array([x, y]) - measurement @ self.state
+        innovation_cov = measurement @ self.cov @ measurement.T + measurement_cov
         if score > 9.0:
             measurement_cov *= score / 9.0
-            innovation_cov = self.cov[:2, :2] + measurement_cov
-        gain = np.linalg.solve(innovation_cov, self.cov[:2, :]).T
+            innovation_cov = measurement @ self.cov @ measurement.T + measurement_cov
+        gain = np.linalg.solve(innovation_cov, measurement @ self.cov).T
         speed, _ = self.motion(timestamp)
         if abs(speed) < 0.3:
-            gain[2:, :] = 0.0  # 정지 중 위치 잡음으로 방향·편향을 바꾸지 않음
+            gain[2:4, :] = 0.0  # 정지 중 위치 잡음으로 방향·자이로 편향을 바꾸지 않음
         delta = gain @ innovation
         scale = min(1.0, self.cfg['max_gps_step'] / max(np.linalg.norm(delta[:2]), 1e-12),
                     math.radians(1.0) / max(abs(delta[2]), 1e-12))
         gain *= scale
         self.state += gain @ innovation
-        residual = np.eye(4)
-        residual[:, :2] -= gain
+        residual = np.eye(6) - gain @ measurement
         self.cov = residual @ self.cov @ residual.T + gain @ measurement_cov @ gain.T
         self.last_gps_update = timestamp
         self._normalize()
         self.counts['gps_update'] += 1
+
+    def _trajectory_heading(self, timestamp, x, y):
+        """한 점의 GPS 방향 대신 여러 점의 궤적과 독립적인 추측항법 궤적을 비교한다."""
+        self.gps_history.append((timestamp, x, y, *self.dead_pose))
+        while self.gps_history and timestamp - self.gps_history[0][0] > self.cfg['heading_window']:
+            self.gps_history.popleft()
+        if (len(self.gps_history) < 12 or abs(self.speed) < 0.5
+                or (self.last_heading_update is not None
+                    and timestamp - self.last_heading_update < self.cfg['heading_period'])):
+            return
+        rows = np.asarray(self.gps_history)
+        if np.ptp(np.unwrap(rows[:, 5])) > self.cfg['heading_max_turn']:
+            return
+        dead, gps = rows[:, 3:5], rows[:, 1:3]
+        distance = float(np.linalg.norm(dead[-1] - dead[0]))
+        if distance < self.cfg['heading_distance']:
+            return
+        # 가중 2차원 회전 맞춤. 큰 잔차를 가진 점의 영향을 줄인다.
+        weights = np.ones(len(rows))
+        for _ in range(3):
+            mean_dead = np.average(dead, axis=0, weights=weights)
+            mean_gps = np.average(gps, axis=0, weights=weights)
+            a, b = dead - mean_dead, gps - mean_gps
+            dot = float(np.sum(weights * np.sum(a * b, axis=1)))
+            cross = float(np.sum(weights * (a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0])))
+            angle = math.atan2(cross, dot)
+            c, s = math.cos(angle), math.sin(angle)
+            rotated = a @ np.array([[c, s], [-s, c]])
+            residuals = np.linalg.norm(b - rotated, axis=1)
+            weights = np.minimum(1.0, 1.5 / np.maximum(residuals, 1e-9))
+        rms = float(np.sqrt(np.average(residuals**2, weights=weights)))
+        if rms > 1.5:
+            self.counts['heading_rejected'] += 1
+            return
+        innovation = wrap(self.dead_pose[2] + angle - self.state[2])
+        variance = max(self.cfg['heading_sigma']**2, (self.cfg['gps_sigma'] / distance)**2)
+        if abs(innovation) > max(0.14, 3.0 * math.sqrt(variance)):
+            self.counts['heading_rejected'] += 1
+            return
+        gain = self.cov[:, 2] / (self.cov[2, 2] + variance)
+        gain[:2] = 0.0
+        gain[4:] = 0.0
+        delta = gain * innovation
+        scale = min(1.0, self.cfg['heading_max_step'] / max(abs(delta[2]), 1e-12),
+                    0.0002 / max(abs(delta[3]), 1e-12))
+        gain *= scale
+        self.state += gain * innovation
+        residual = np.eye(6)
+        residual[:, 2] -= gain
+        self.cov = residual @ self.cov @ residual.T + np.outer(gain, gain) * variance
+        self._normalize()
+        self.last_heading_update = timestamp
+        self.diagnostics['heading_residual_deg'] = math.degrees(innovation)
+        self.diagnostics['heading_fit_rms_m'] = rms
+        self.counts['trajectory_heading_update'] += 1
 
     def _normalize(self):
         self.state[2] = wrap(self.state[2])
@@ -196,15 +309,25 @@ class Localization(Node):
         self.create_timer(1.0 / RATE_HZ, self.publish)
 
     def on_reset(self, checkpoint, reload):
+        if self.ready:
+            self.log_diagnostics('RESPAWN/START')
         if reload or self.course is None:
             self.course = load_course(self)
         self.reset(self.course.pose(checkpoint))
 
     def on_end(self):
         if self.ready:
-            self.get_logger().info(f'위치 추정 통계: {dict(self.filter.counts)}, 수신: {dict(self.received)}')
+            self.log_diagnostics('END')
         self.ready = False
         self.queue.clear()
+
+    def log_diagnostics(self, reason):
+        f = self.filter
+        detail = dict(f.diagnostics)
+        detail['gyro_bias_rad_s'] = float(f.state[3])
+        detail['gps_bias_xy_m'] = f.state[4:].tolist()
+        detail['position_sigma_m'] = np.sqrt(np.maximum(np.diag(f.cov)[:2], 0.0)).tolist()
+        self.get_logger().info(f'위치 추정 {reason}: 처리={dict(f.counts)}, 수신={dict(self.received)}, 추정={detail}')
 
     def reset(self, pose):
         self.ready = pose is not None
