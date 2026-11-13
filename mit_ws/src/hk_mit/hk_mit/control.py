@@ -64,7 +64,7 @@ TARGET_SPEED_DEFAULT = 5.0
 FAST_PARAMS = {
     'a_lat_max': 3.5,       # 마른 노면 커브 (안전 3.0). 3.8 + v_max 15에서 cp2 뒤·cp5 뒤 커브 충돌
     'a_decel': 3.0,         # 커브 앞 감속 계획
-    'a_lat_lowmu': 1.45,    # 저마찰 커브 (안전 1.3, mu=0.2 한계 1.96)
+    'a_lat_lowmu': 1.55,    # 저마찰 커브 (안전 1.3, mu=0.2 한계 1.96)
     'a_lat_slope': 3.3,     # 경사 헤어핀 (안전 3.0)
     'v_max_obstacle': 6.0,  # 장애물 구간 (안전 5.0)
 }

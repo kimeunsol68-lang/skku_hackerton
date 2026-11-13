@@ -604,6 +604,7 @@ def build_path(start, prims, ds=0.1):
     return out
 
 
+REAR_STOP_CHECK_S = 0.12     # 후면주차 정지 확인 (T자 진입 끝 정지 -> 후진 전환 대기 최소화)
 GATE_SCANS = 10             # 후면주차 통로 추정에 쓰는 최근 스캔 수 (10 Hz -> 1 s)
 
 
@@ -877,7 +878,7 @@ class RearParking(Parking):
             acc, brk = self._speed(self._path_speed(i, p['rpark_v_enter_fast'], p['rpark_v_enter']), v, dt)
             return acc, brk, steer, D
         if st == 'STOP':
-            if self._stopped(v, now):
+            if self._stopped(v, now, REAR_STOP_CHECK_S):
                 self.y_tgt = self.slot_c() + (CAR_LEN / 2 - REAR_OVERHANG)
                 self.path = self._reverse_path(x, y)
                 self.rev_tol = 0.15                                  # 후진 정지 앞당김: 0.3이면 약 0.13 m 덜 들어가 보정이 한 번 필요했음
@@ -903,7 +904,7 @@ class RearParking(Parking):
             acc, brk = self._speed(v_t, v, dt)
             return acc, brk, steer, R
         if st == 'STOP_REV':
-            if self._stopped(v, now):
+            if self._stopped(v, now, REAR_STOP_CHECK_S):
                 ok, a, b, psi = self._in_slot(x, y, yaw)
                 self.log(f'rear: 정지 벽y={self.wall_y} x={x:.2f} y={y:.2f} a={a:.2f} b={b:.2f} psi={math.degrees(psi):.1f}도 안={ok} 시도 {self.tries}')
                 if ok:
@@ -997,10 +998,6 @@ class ParkingMission(MissionBase):
         name = 'parallel_parking' if inp.cp.section == ('cp8','cp9') else 'rear_parking'
         if not option_on(options, name):
             return MissionOutput(is_done=True)
-        from .course import fast_mode
-        if fast_mode(options) and not getattr(self.ppark, 'fast_applied', False):
-            self.ppark.p.update(park_decel=2.5)          # 공격 모드: 평행주차 접근 감속 1.8 -> 2.5
-            self.ppark.fast_applied = True
         if inp.cp.section == ('cp8', 'cp9'):
             return self.parallel_parking(inp)
         return self.rear_parking(inp)

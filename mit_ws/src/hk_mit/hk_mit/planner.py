@@ -255,7 +255,7 @@ class Planner(Node):
         for k in range(first, last):
             cap = 0.0
             # Plan braking before the direct parking controller takes over.
-            for cp_index, option, limit in ((7, 'parallel_parking', 6.0), (8, 'rear_parking', 5.0)):
+            for cp_index, option, limit in ((7, 'parallel_parking', 6.0), (8, 'rear_parking', 8.0)):
                 if len(gates) > cp_index and option_on(opts, option) and gates[cp_index]-10 <= k <= gates[cp_index]+12:
                     cap = limit if cap == 0.0 else min(cap, limit)
             result.append((*self.route.points[k], self.route.yaw_at(k), cap))

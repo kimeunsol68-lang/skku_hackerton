@@ -18,7 +18,7 @@ hk_mit_planner:
     park_v_adjust: 1.4       # 보정·탈출 속력 (0.5 -> 1.4)
     park_v_exit: 2.0         # 3.0 swung across the lane into the far wall leaving the slot (seed 6, GNSS error 0.6 m)
     park_decel: 1.8          # 접근 감속 계획 (1.0 -> 1.8): 접근 구간 단축
-    rpark_v_enter_fast: 5.0  # 후면주차 진입 직선 (6.5에서 충돌 -> 5.0). 호 구간은 rpark_v_enter 3.0
+    rpark_v_enter_fast: 8.0  # 후면주차 진입 직선 (5.0 -> 8.0, cp9 앞 플래너 상한도 8.0). 호 구간은 rpark_v_enter
     rpark_a_dec: 3.0         # 후면주차 호 앞 감속 계획 (2.0 -> 3.0: 직선 고속 구간 연장)
     rpark_v_enter: 3.4       # 진입 호 3.0 -> 3.4 (진입 두 번째 회전을 0.4 m 일찍 시작해 동쪽 벽 여유 확보)
     rpark_v_exit: 3.4        # 탈출 호 3.0 -> 3.4
