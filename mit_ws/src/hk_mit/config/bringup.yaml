@@ -21,7 +21,7 @@ hk_mit_planner:
     rpark_v_enter_fast: 8.0  # 후면주차 진입 직선 (5.0 -> 8.0, cp9 앞 플래너 상한도 8.0). 호 구간은 rpark_v_enter
     rpark_a_dec: 3.0         # 후면주차 호 앞 감속 계획 (2.0 -> 3.0: 직선 고속 구간 연장)
     rpark_v_enter: 3.4       # 진입 호 3.0 -> 3.4 (진입 두 번째 회전을 0.4 m 일찍 시작해 동쪽 벽 여유 확보)
-    rpark_v_exit: 3.4        # 탈출 호 3.0 -> 3.4
+    rpark_v_exit: 3.8        # 탈출 호 3.0 -> 3.8
     rpark_v_exit_fast: 8.0   # 후면주차 탈출 직선 (6.0 -> 8.0)
     park_phase_timeout_s: 9.0   # 후진/전진 등 한 phase 최대 시간 (s). 정상 후진(~7 s)은 끊지 않음
     park_total_timeout_s: 22.0  # 전체 주차 시도 최대 시간 (s). 넘으면 멈춘 자리에서 완료 처리
